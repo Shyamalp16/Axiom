@@ -1369,6 +1369,78 @@ export async function fetchPumpFunRecentTrades(
 }
 
 /**
+ * Fetch pump.fun holder distribution by analyzing trade history
+ * Returns estimated holder balances based on buy/sell activity
+ */
+export async function fetchPumpFunHolders(
+  mint: string,
+  limit: number = 200
+): Promise<{ address: string; balance: number; percent: number }[]> {
+  try {
+    const params = new URLSearchParams({
+      limit: limit.toString(),
+      offset: '0',
+      minimumSize: '0',
+    });
+    
+    const response = await fetch(`${PUMPFUN_API_URL}/trades/all/${mint}?${params}`, {
+      headers: {
+        'Accept': 'application/json',
+        'Origin': 'https://pump.fun',
+      },
+    });
+    
+    if (!response.ok) {
+      logger.debug(`Pump.fun trades API returned ${response.status}`);
+      return [];
+    }
+    
+    const trades = await response.json() as any[];
+    
+    if (!Array.isArray(trades) || trades.length === 0) {
+      return [];
+    }
+    
+    // Build holder map from trades
+    const holderMap = new Map<string, number>();
+    
+    for (const trade of trades) {
+      const user = trade.user || trade.traderPublicKey || trade.trader;
+      if (!user) continue;
+      
+      const tokenAmount = (trade.token_amount || trade.tokenAmount || 0) / 1e6;
+      const isBuy = trade.is_buy || trade.isBuy || trade.txType === 'buy';
+      
+      const currentBalance = holderMap.get(user) || 0;
+      
+      if (isBuy) {
+        holderMap.set(user, currentBalance + tokenAmount);
+      } else {
+        holderMap.set(user, Math.max(0, currentBalance - tokenAmount));
+      }
+    }
+    
+    // Convert to array and calculate percentages
+    const totalSupply = 1_000_000_000; // Pump.fun tokens have 1B supply
+    const holders = [...holderMap.entries()]
+      .filter(([_, balance]) => balance > 0)
+      .map(([address, balance]) => ({
+        address,
+        balance,
+        percent: (balance / totalSupply) * 100,
+      }))
+      .sort((a, b) => b.balance - a.balance);
+    
+    logger.debug(`Pump.fun holders derived from trades: ${holders.length} holders`);
+    return holders;
+    
+  } catch (error) {
+    logger.debug(`Pump.fun holder analysis failed: ${error}`);
+    return [];
+  }
+}
+
+/**
  * Calculate recent volume from pump.fun trades
  */
 export async function fetchPumpFunRecentVolume(

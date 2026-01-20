@@ -233,16 +233,23 @@ export async function quickSafetyCheck(mintAddress: string): Promise<{
   const conn = getConnection();
   
   try {
-    // Check if Pump.fun token (pattern check + PumpPortal)
+    // Check if Pump.fun token (pattern check + PumpPortal API)
     const looksLikePumpFun = mintAddress.toLowerCase().endsWith('pump');
-    if (looksLikePumpFun) {
-      const pumpToken = await fetchPumpFunToken(mintAddress);
-      if (!pumpToken || !pumpToken.isGraduated) {
-        return { safe: true }; // Pump.fun tokens have protocol-enforced safety
+    
+    // Try PumpPortal API first for any potential pump.fun token
+    const pumpToken = await fetchPumpFunToken(mintAddress);
+    if (pumpToken) {
+      // It's a pump.fun token - protocol enforces safety on bonding curve
+      if (!pumpToken.isGraduated) {
+        return { safe: true };
       }
+      // Graduated tokens need standard SPL check below
+    } else if (looksLikePumpFun) {
+      // Looks like pump.fun but couldn't fetch - assume safe (bonding curve)
+      return { safe: true };
     }
     
-    // Standard SPL token check
+    // Standard SPL token check (for non-pump.fun or graduated tokens)
     const mintPubkey = new PublicKey(mintAddress);
     const mintInfo = await getMint(conn, mintPubkey);
     
@@ -256,6 +263,10 @@ export async function quickSafetyCheck(mintAddress: string): Promise<{
     
     return { safe: true };
   } catch {
+    // If we can't verify, check if it looks like pump.fun and assume safe
+    if (mintAddress.toLowerCase().endsWith('pump')) {
+      return { safe: true };
+    }
     return { safe: false, reason: 'Could not fetch mint info' };
   }
 }

@@ -31,10 +31,9 @@ This bot enforces discipline through code. No overrides. No "it looks good anywa
    - Dev wallet < 10% and not increasing
 
 3. **Age & Context**
-   - Token age: 3-20 minutes (sweet spot)
+   - Token age: configurable via DISCOVERY_CONFIG
    - Already pumped 2x-5x from launch
    - Volume still active (not dead)
-   - Rejects: Fresh < 2min (bot war), Old > 30min (dead)
 
 4. **Volume & Momentum**
    - Pullback volume ≥ 40% of pump volume
@@ -85,12 +84,20 @@ Instant exit triggers:
 
 ### Pump.fun Specific Rules
 
-When trading on Pump.fun bonding curve:
-- Bonding curve progress: 15-85% (sweet spot: 25-70%)
-- Market cap: $8k-$50k (before graduation)
-- Age: ≥2 minutes (avoids bot war zone)
-- Minimum engagement: 3+ replies
+When trading on Pump.fun bonding curve (all configurable in `src/discovery/token-discovery.ts`):
+- Bonding curve progress: configurable (default 15-99%)
+- Market cap: configurable (default $3k-$60k)
+- Age: configurable (default 1-60 min)
+- Minimum engagement: configurable trade count
 - Auto-routes: Pump.fun vs Jupiter based on graduation status
+
+### Token Discovery
+
+Multi-strategy discovery engine:
+- **LIVE** - tokens being actively traded now
+- **VOLATILE** - tokens with price movement
+- **NEWEST** - recently created tokens
+- **Watch & Revisit** - tracks new tokens, checks for momentum after delay
 
 ## Installation
 
@@ -132,79 +139,108 @@ BIRDEYE_API_KEY=your_birdeye_api_key
 
 ## Usage
 
-### Interactive Mode
-```bash
-npm run bot
-```
+### Commands
 
-### Check a Token (No Trade)
 ```bash
+# Interactive bot mode
+npm run bot
+
+# Check a specific token (no trade)
 npm run check <mint_address>
 
-# Example:
-npm run check EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
-```
-
-### View Status & Stats
-```bash
+# View status & stats
 npm run status
-```
 
-### Development Mode (Hot Reload)
-```bash
+# Test setup/connection
+npm run test:setup
+
+# Test token discovery (polls for candidates, runs safety checks)
+npm run test:discovery
+
+# Paper trading (simulated trades)
+npm run paper              # Start paper trading
+npm run paper:check        # Check paper positions
+npm run paper:stats        # View paper trading stats
+npm run paper:reset        # Reset paper trading data
+npm run paper:export       # Export paper trade history
+
+# Development mode (hot reload)
 npm run dev
+
+# Build for production
+npm run build
+npm run start
 ```
 
 ## Project Structure
 
 ```
 src/
-├── config/
-│   ├── constants.ts     # All hard-coded rules (DO NOT MODIFY)
-│   └── index.ts         # Config exports
-├── types/
-│   └── index.ts         # TypeScript types
-├── utils/
-│   ├── logger.ts        # Colored logging
-│   └── solana.ts        # Solana utilities
 ├── api/
-│   ├── data-providers.ts # Birdeye/Helius APIs
-│   └── pump-fun.ts       # Pump.fun bonding curve API
+│   ├── data-providers.ts  # Birdeye/Helius/DexScreener APIs
+│   ├── pump-fun.ts        # Pump.fun token operations
+│   ├── pump-portal.ts     # PumpPortal WebSocket + REST API
+│   └── metis-swap.ts      # Swap execution
+├── bot/
+│   ├── orchestrator.ts    # Main controller
+│   └── auto-orchestrator.ts # Automated trading
 ├── checkers/
-│   ├── token-safety.ts   # Mint/freeze/LP checks (DEX)
+│   ├── pre-trade-checklist.ts # Main safety checklist
 │   ├── pump-fun-safety.ts # Pump.fun specific checks
+│   ├── token-safety.ts    # Mint/freeze/LP checks
 │   ├── wallet-distribution.ts
 │   ├── age-context.ts
-│   ├── volume-momentum.ts
-│   └── pre-trade-checklist.ts # Auto-routes Pump vs DEX
-├── trading/
-│   ├── entry-logic.ts    # Entry conditions
-│   ├── position-manager.ts
-│   ├── tp-sl-manager.ts  # Automated TP/SL
-│   └── executor.ts       # Jupiter + Pump.fun swaps
-├── monitoring/
-│   └── dev-wallet-monitor.ts
-├── storage/
-│   └── trade-logger.ts   # Trade history
-├── bot/
-│   └── orchestrator.ts   # Main controller
+│   └── volume-momentum.ts
 ├── cli/
-│   ├── check-token.ts
-│   └── status.ts
-└── index.ts              # Entry point
+│   ├── auto-trade.ts      # Auto trading CLI
+│   ├── check-token.ts     # Token checker
+│   ├── paper-trade.ts     # Paper trading
+│   ├── test-discovery.ts  # Discovery testing
+│   ├── test-setup.ts      # Setup testing
+│   └── status.ts          # Status display
+├── config/
+│   ├── constants.ts       # Trading rules
+│   └── index.ts
+├── discovery/
+│   ├── token-discovery.ts # Multi-strategy discovery + config
+│   └── candidate-queue.ts # Priority queue
+├── monitoring/
+│   ├── dev-wallet-monitor.ts
+│   └── price-monitor.ts
+├── pipeline/
+│   └── trade-pipeline.ts  # Trade execution pipeline
+├── trading/
+│   ├── entry-logic.ts
+│   ├── executor.ts
+│   ├── paper-trader.ts
+│   ├── position-manager.ts
+│   └── tp-sl-manager.ts
+└── index.ts
 ```
 
-## Hard-Coded Rules (constants.ts)
+## Configuration
 
-These values are **battle-tested**. Do not modify unless you have a very good reason:
+### Discovery Config (`src/discovery/token-discovery.ts`)
+
+Single source of truth for token filtering:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| minAgeMinutes | 1 | Minimum token age |
+| maxAgeMinutes | 60 | Maximum token age |
+| minProgress | 15 | Min bonding curve % |
+| maxProgress | 99 | Max bonding curve % |
+| minMarketCap | $3,000 | Min market cap |
+| maxMarketCap | $60,000 | Max market cap |
+| minTradeCount | 1 | Min trades/engagement |
+
+### Trading Rules (`src/config/constants.ts`)
 
 | Rule | Value |
 |------|-------|
 | Min LP | 25 SOL (floor), 30 SOL (ideal) |
 | Max Single Wallet | 15% |
 | Max Top 5 Wallets | 40% |
-| Token Age | 3-20 minutes |
-| Pump Range | 2x-5x |
 | Stop Loss | -6% |
 | Time Stop | 4 minutes |
 | TP1 | +20% (sell 40%) |
@@ -213,14 +249,6 @@ These values are **battle-tested**. Do not modify unless you have a very good re
 | Max Daily Trades | 2 |
 | Max Daily Loss | 0.2 SOL |
 | Max Weekly Loss | 0.5 SOL |
-| **Pump.fun** | |
-| Min Curve Progress | 15% |
-| Max Curve Progress | 85% |
-| Ideal Curve Range | 25-70% |
-| Min Market Cap | $8,000 |
-| Max Market Cap | $50,000 |
-| Min Age | 2 minutes |
-| Min Replies | 3 |
 
 ## Trade Logging
 

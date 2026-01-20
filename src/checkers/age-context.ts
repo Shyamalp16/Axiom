@@ -6,6 +6,7 @@
  */
 
 import { AGE_CONTEXT_FILTER, VOLUME_MOMENTUM } from '../config/index.js';
+import { DISCOVERY_CONFIG } from '../discovery/token-discovery.js';
 import { fetchTokenInfo, fetchMarketData, fetchRecentVolume } from '../api/data-providers.js';
 import logger from '../utils/logger.js';
 
@@ -39,21 +40,19 @@ export async function checkAgeContext(mintAddress: string): Promise<AgeContextRe
     const tokenInfo = await fetchTokenInfo(mintAddress);
     ageMinutes = tokenInfo.ageMinutes;
     
-    // Check age constraints
-    const inBotWarZone = ageMinutes < AGE_CONTEXT_FILTER.BOT_WAR_ZONE_MINUTES;
-    const tooYoung = ageMinutes < AGE_CONTEXT_FILTER.MIN_AGE_MINUTES;
-    const tooOld = ageMinutes > AGE_CONTEXT_FILTER.MAX_AGE_MINUTES;
-    const hardTooOld = ageMinutes > AGE_CONTEXT_FILTER.HARD_MAX_AGE_MINUTES;
+    // Check age constraints (use DISCOVERY_CONFIG for consistency)
+    const minAge = DISCOVERY_CONFIG.minAgeMinutes;
+    const maxAge = DISCOVERY_CONFIG.maxAgeMinutes;
+    const tooYoung = ageMinutes < minAge;
+    const tooOld = ageMinutes > maxAge;
     
-    if (inBotWarZone) {
-      failures.push(`Token too fresh (${ageMinutes.toFixed(1)} min) - bot war zone!`);
-    } else if (tooYoung) {
-      failures.push(`Token too young (${ageMinutes.toFixed(1)} min) - min ${AGE_CONTEXT_FILTER.MIN_AGE_MINUTES} min`);
+    if (tooYoung) {
+      failures.push(`Token too young (${ageMinutes.toFixed(1)} min) - min ${minAge} min`);
     }
     
     logger.checklist(
-      `Age ≥ ${AGE_CONTEXT_FILTER.MIN_AGE_MINUTES} min`,
-      !tooYoung && !inBotWarZone,
+      `Age ≥ ${minAge} min`,
+      !tooYoung,
       `${ageMinutes.toFixed(1)} min`
     );
     
@@ -111,15 +110,15 @@ export async function checkAgeContext(mintAddress: string): Promise<AgeContextRe
     );
     
     // 4. Check if too old (with volume exception)
-    if (hardTooOld && !isVolumeActive) {
-      failures.push(`Hard reject: ${ageMinutes.toFixed(0)} min old, volume dead`);
+    if (tooOld && !isVolumeActive) {
+      failures.push(`Too old: ${ageMinutes.toFixed(0)} min (max ${maxAge} min) with weak volume`);
     } else if (tooOld && isVolumeActive) {
       warnings.push('Token older than ideal but volume still active');
     }
     
     logger.checklist(
-      `Age ≤ ${AGE_CONTEXT_FILTER.MAX_AGE_MINUTES} min (or volume exploding)`,
-      !hardTooOld || isVolumeActive,
+      `Age ≤ ${maxAge} min (or volume active)`,
+      !tooOld || isVolumeActive,
       `${ageMinutes.toFixed(1)} min`
     );
     
@@ -154,22 +153,18 @@ export async function checkAgeContext(mintAddress: string): Promise<AgeContextRe
 }
 
 /**
- * Quick age check for filtering
+ * Quick age check for filtering (uses DISCOVERY_CONFIG)
  */
 export function isAgeAcceptable(ageMinutes: number): {
   acceptable: boolean;
   reason?: string;
 } {
-  if (ageMinutes < AGE_CONTEXT_FILTER.BOT_WAR_ZONE_MINUTES) {
-    return { acceptable: false, reason: 'Bot war zone (< 2 min)' };
+  if (ageMinutes < DISCOVERY_CONFIG.minAgeMinutes) {
+    return { acceptable: false, reason: `Too young (< ${DISCOVERY_CONFIG.minAgeMinutes} min)` };
   }
   
-  if (ageMinutes < AGE_CONTEXT_FILTER.MIN_AGE_MINUTES) {
-    return { acceptable: false, reason: 'Too young' };
-  }
-  
-  if (ageMinutes > AGE_CONTEXT_FILTER.HARD_MAX_AGE_MINUTES) {
-    return { acceptable: false, reason: 'Too old (> 30 min)' };
+  if (ageMinutes > DISCOVERY_CONFIG.maxAgeMinutes) {
+    return { acceptable: false, reason: `Too old (> ${DISCOVERY_CONFIG.maxAgeMinutes} min)` };
   }
   
   return { acceptable: true };

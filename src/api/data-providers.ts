@@ -215,15 +215,25 @@ export async function fetchTokenCreationTime(mintAddress: string): Promise<Date>
 
 /**
  * Fetch token holders
- * Birdeye endpoint: GET /defi/v3/token/holder
+ * For pump.fun: derives from trade history
+ * For others: uses Birdeye endpoint GET /defi/v3/token/holder
  */
 export async function fetchTokenHolders(
   mintAddress: string
 ): Promise<{ address: string; balance: number; percent: number }[]> {
-  // Pump.fun tokens don't have a reliable public holder endpoint
-  // Skip Birdeye to avoid rate limits and return empty for now
+  // For pump.fun tokens, derive holders from trade history
   if (mintAddress.toLowerCase().endsWith('pump')) {
-    logger.debug('Pump.fun holders unavailable - skipping Birdeye holder fetch');
+    try {
+      const { fetchPumpFunHolders } = await import('./pump-portal.js');
+      const holders = await fetchPumpFunHolders(mintAddress, 200);
+      
+      if (holders.length > 0) {
+        logger.debug(`Pump.fun holders from trades: ${holders.length} found`);
+        return holders;
+      }
+    } catch (error) {
+      logger.debug(`Pump.fun holder fetch failed: ${error instanceof Error ? error.message : 'Unknown'}`);
+    }
     return [];
   }
   
@@ -258,8 +268,8 @@ export async function fetchTokenHolders(
 
 /**
  * Fetch LP information
- * Uses DexScreener (free, no rate limits) for DEX detection
- * Falls back to Birdeye for liquidity data
+ * For pump.fun tokens: uses Birdeye (DexScreener doesn't track bonding curves)
+ * For DEX tokens: uses DexScreener (free, no rate limits)
  */
 export async function fetchLPInfo(mintAddress: string): Promise<{
   platform: 'raydium' | 'bags' | 'meteora' | 'meteora_v2' | 'pump_amm' | 'unknown';
@@ -270,21 +280,45 @@ export async function fetchLPInfo(mintAddress: string): Promise<{
   let detectedPlatform: 'raydium' | 'bags' | 'meteora' | 'meteora_v2' | 'pump_amm' | 'unknown' = 'unknown';
   let lpAddresses: string[] = [];
   
+  // For pump.fun tokens, skip DexScreener (it doesn't understand bonding curves)
+  // Go straight to Birdeye or pump.fun API
+  const looksLikePumpFun = mintAddress.toLowerCase().endsWith('pump');
+  
+  if (looksLikePumpFun) {
+    // Use pump.fun API for bonding curve liquidity
+    try {
+      const { fetchTokenViaPumpPortal } = await import('./pump-portal.js');
+      const pumpToken = await fetchTokenViaPumpPortal(mintAddress);
+      
+      if (pumpToken && !pumpToken.isGraduated) {
+        // Token is still on bonding curve
+        detectedPlatform = 'pump_amm';
+        // Virtual SOL reserves represent the liquidity
+        totalLiquidity = pumpToken.virtualSolReserves || 0;
+        
+        logger.info(`[LP] Pump.fun bonding curve: ${totalLiquidity.toFixed(2)} SOL virtual liquidity`);
+        return { platform: detectedPlatform, solAmount: totalLiquidity, lpAddresses: [] };
+      }
+    } catch (error) {
+      logger.debug(`[LP] Pump.fun API error: ${error instanceof Error ? error.message : 'Unknown'}`);
+    }
+  }
+  
   // Method 1: DexScreener API (FREE, no rate limits, includes DEX source)
-  // This is the most reliable way to get DEX info
+  // Only for non-pump.fun or graduated tokens
   try {
     const dexScreenerResponse = await fetch(
       `${DEXSCREENER_BASE}/tokens/${mintAddress}`,
       { headers: { 'Accept': 'application/json' } }
     );
     
-    logger.info(`[LP] DexScreener status: ${dexScreenerResponse.status}`);
+    logger.debug(`[LP] DexScreener status: ${dexScreenerResponse.status}`);
     
     if (dexScreenerResponse.ok) {
       const dexData = await dexScreenerResponse.json() as any;
       const pairs = dexData?.pairs || [];
       
-      logger.info(`[LP] DexScreener pairs found: ${pairs.length}`);
+      logger.debug(`[LP] DexScreener pairs found: ${pairs.length}`);
       
       if (pairs.length > 0) {
         // Sort by liquidity and get the best pair
@@ -295,7 +329,7 @@ export async function fetchLPInfo(mintAddress: string): Promise<{
         
         // DexScreener uses "dexId" field for the exchange
         const dexId = topPair.dexId || '';
-        logger.info(`[LP] DexScreener dexId: "${dexId}", liquidity: $${topPair.liquidity?.usd || 0}`);
+        logger.debug(`[LP] DexScreener dexId: "${dexId}", liquidity: $${topPair.liquidity?.usd || 0}`);
         
         // Map DexScreener dexId to our platform names
         detectedPlatform = detectDexPlatformFromDexScreener(dexId);
@@ -308,7 +342,7 @@ export async function fetchLPInfo(mintAddress: string): Promise<{
         
         lpAddresses = [topPair.pairAddress].filter(Boolean);
         
-        logger.info(`[LP] Detected: ${detectedPlatform}, ~${totalLiquidity.toFixed(2)} SOL liquidity`);
+        logger.debug(`[LP] Detected: ${detectedPlatform}, ~${totalLiquidity.toFixed(2)} SOL liquidity`);
         
         if (detectedPlatform !== 'unknown' && totalLiquidity > 0) {
           return { platform: detectedPlatform, solAmount: totalLiquidity, lpAddresses };
@@ -316,7 +350,7 @@ export async function fetchLPInfo(mintAddress: string): Promise<{
       }
     }
   } catch (error) {
-    logger.warn(`[LP] DexScreener error: ${error instanceof Error ? error.message : 'Unknown'}`);
+    logger.debug(`[LP] DexScreener error: ${error instanceof Error ? error.message : 'Unknown'}`);
   }
   
   // Method 2: Birdeye token_overview for liquidity (if DexScreener failed)

@@ -23,6 +23,7 @@ import {
   fetchTokenViaPumpPortal,
   waitForNewTokens,
   isConnectedToPumpPortal,
+  fetchPumpFunRecentTrades as fetchTradesViaRest,
   PumpPortalToken,
   PumpPortalTrade,
   PumpPortalNewToken,
@@ -205,30 +206,33 @@ export async function isPumpFunToken(mintAddress: string): Promise<boolean> {
 
 /**
  * Fetch recent trades for a Pump.fun token
+ * Uses REST API for historical trades (more reliable than WebSocket cache)
  */
 export async function fetchPumpFunTrades(
   mintAddress: string,
   limit: number = 50
 ): Promise<PumpFunTrade[]> {
   try {
-    // Ensure connected
-    if (!isConnectedToPumpPortal()) {
-      await connectPumpPortal();
+    // Use REST API for historical trades (much more reliable)
+    const trades = await fetchTradesViaRest(mintAddress, limit);
+    
+    if (trades.length > 0) {
+      return trades.map(t => ({
+        signature: t.signature,
+        mint: mintAddress,
+        solAmount: t.solAmount,
+        tokenAmount: t.tokenAmount,
+        isBuy: t.isBuy,
+        user: '',
+        timestamp: t.timestamp,
+        slot: 0,
+      }));
     }
     
-    // Get cached trades
+    // Fallback to WebSocket cache if REST fails
     const portalTrades = getCachedTrades(mintAddress);
     
-    if (portalTrades.length === 0) {
-      // Subscribe to start receiving trades
-      subscribeTokenTrades([mintAddress], () => {});
-      
-      // Wait a moment for trades to come in
-      await new Promise(resolve => setTimeout(resolve, 2000));
-    }
-    
-    // Convert to PumpFunTrade format
-    return getCachedTrades(mintAddress)
+    return portalTrades
       .slice(0, limit)
       .map((t: PumpPortalTrade) => ({
         signature: t.signature,

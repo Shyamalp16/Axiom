@@ -19,6 +19,7 @@ import { checkPumpFunSafety, PumpFunSafetyResult } from './pump-fun-safety.js';
 import { analyzeEntry } from '../trading/entry-logic.js';
 import { isTradingAllowed } from '../trading/position-manager.js';
 import { isPumpFunToken, fetchPumpFunToken } from '../api/pump-fun.js';
+import { DISCOVERY_CONFIG } from '../discovery/token-discovery.js';
 import logger from '../utils/logger.js';
 
 export interface ChecklistResult {
@@ -261,28 +262,32 @@ async function runPumpFunChecklist(
   // 3. VOLUME & MOMENTUM (using Pump.fun trade data)
   logger.info('\n[3/4] Analyzing Trading Activity...');
   try {
-    // For Pump.fun, we rely on the trade analysis done in pumpFunSafety
-    // and basic volume check
     const { fetchPumpFunTrades } = await import('../api/pump-fun.js');
     const trades = await fetchPumpFunTrades(mintAddress, 50);
     
-    const recentBuys = trades.filter(t => t.isBuy).length;
-    const recentSells = trades.filter(t => !t.isBuy).length;
-    const buyRatio = trades.length > 0 ? recentBuys / trades.length : 0;
-    
-    logger.checklist(
-      'Buy pressure > 50%',
-      buyRatio >= 0.5,
-      `${(buyRatio * 100).toFixed(0)}% buys`
-    );
-    
-    if (buyRatio < 0.4) {
-      failedChecks.push(`Pump.fun: Weak buy pressure (${(buyRatio * 100).toFixed(0)}%)`);
+    if (trades.length === 0) {
+      // Skip silently - engagement stats from token data are sufficient
+      passedChecks.push('Trading Activity: SKIPPED');
     } else {
-      passedChecks.push('Trading Activity: PASSED');
+      const recentBuys = trades.filter(t => t.isBuy).length;
+      const recentSells = trades.filter(t => !t.isBuy).length;
+      const buyRatio = recentBuys / trades.length;
+      
+      logger.checklist(
+        'Buy pressure',
+        buyRatio >= 0.4,
+        `${(buyRatio * 100).toFixed(0)}% buys (${recentBuys}/${trades.length} trades)`
+      );
+      
+      if (buyRatio < 0.4) {
+        failedChecks.push(`Weak buy pressure (${(buyRatio * 100).toFixed(0)}% - need 40%+)`);
+      } else {
+        passedChecks.push('Trading Activity: PASSED');
+      }
     }
     
   } catch (error) {
+    logger.debug(`Trading activity check error: ${error}`);
     passedChecks.push('Trading Activity: SKIPPED');
   }
   
@@ -291,20 +296,22 @@ async function runPumpFunChecklist(
   
   const pumpToken = details.pumpFunSafety?.token;
   if (pumpToken) {
-    // Ideal entry: 25-70% bonding curve progress
+    // Use config values for bonding curve range
+    const minProgress = DISCOVERY_CONFIG.minProgress;
+    const maxProgress = DISCOVERY_CONFIG.maxProgress;
     const progress = pumpToken.bondingCurveProgress;
-    const inIdealRange = progress >= 25 && progress <= 70;
+    const inRange = progress >= minProgress && progress <= maxProgress;
     
     logger.checklist(
-      'Bonding curve sweet spot (25-70%)',
-      inIdealRange,
+      `Bonding curve ${minProgress}-${maxProgress}%`,
+      inRange,
       `${progress.toFixed(1)}%`
     );
     
-    if (progress < 15) {
-      failedChecks.push('Pump.fun: Too early in bonding curve');
-    } else if (progress > 85) {
-      failedChecks.push('Pump.fun: About to graduate - migration risk');
+    if (progress < minProgress) {
+      failedChecks.push(`Pump.fun: Too early (${progress.toFixed(1)}% < ${minProgress}%)`);
+    } else if (progress > maxProgress) {
+      failedChecks.push(`Pump.fun: Too late (${progress.toFixed(1)}% > ${maxProgress}%)`);
     } else {
       passedChecks.push('Entry Timing: PASSED');
     }

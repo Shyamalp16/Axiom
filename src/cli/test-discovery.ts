@@ -33,11 +33,11 @@ async function main(): Promise<void> {
   
   // Show config
   logger.box('Discovery Config', [
+    `Strategies: LIVE → VOLATILE → NEWEST (rotating)`,
     `Poll interval: ${DISCOVERY_CONFIG.pollIntervalMs / 1000}s`,
-    `Age range: ${DISCOVERY_CONFIG.minAgeMinutes}-${DISCOVERY_CONFIG.maxAgeMinutes} min`,
-    `Progress range: ${DISCOVERY_CONFIG.minProgress}-${DISCOVERY_CONFIG.maxProgress}%`,
+    `Watch delay: ${DISCOVERY_CONFIG.watchDelayMs / 1000}s (for new tokens)`,
     `Market cap: $${DISCOVERY_CONFIG.minMarketCap}-$${DISCOVERY_CONFIG.maxMarketCap}`,
-    `Min trades: ${DISCOVERY_CONFIG.minTradeCount}`,
+    `Age: ${DISCOVERY_CONFIG.minAgeMinutes}-${DISCOVERY_CONFIG.maxAgeMinutes} min`,
   ]);
   
   // Connect to PumpPortal
@@ -167,12 +167,14 @@ async function main(): Promise<void> {
   const passed = results.filter(r => r.fullCheck).length;
   const failed = results.filter(r => !r.fullCheck).length;
   
+  const stats = discovery.getStats();
   logger.box('Results', [
     `Candidates analyzed: ${candidatesAnalyzed}`,
     `Passed full checklist: ${passed}`,
     `Failed: ${failed}`,
-    `Discovery polls: ${discovery.getStats().pollCount}`,
-    `Total candidates found: ${discovery.getStats().candidatesFound}`,
+    `Discovery polls: ${stats.pollCount}`,
+    `Total candidates found: ${stats.candidatesFound}`,
+    `Watchlist promoted: ${stats.watchlistPromoted}`,
   ]);
   
   if (results.length > 0) {

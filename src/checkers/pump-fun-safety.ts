@@ -11,6 +11,7 @@
  */
 
 import { PUMP_FUN } from '../config/index.js';
+import { DISCOVERY_CONFIG } from '../discovery/token-discovery.js';
 import { 
   fetchPumpFunToken, 
   fetchPumpFunTrades,
@@ -82,69 +83,72 @@ export async function checkPumpFunSafety(mintAddress: string): Promise<PumpFunSa
     };
   }
   
-  // 2. Check bonding curve progress
+  // 2. Check bonding curve progress (use DISCOVERY_CONFIG for consistency)
   const progress = token.bondingCurveProgress;
+  const minProgress = DISCOVERY_CONFIG.minProgress;
+  const maxProgress = DISCOVERY_CONFIG.maxProgress;
   
-  if (progress < PUMP_FUN.MIN_BONDING_CURVE_PROGRESS) {
-    failures.push(`Bonding curve too early: ${progress.toFixed(1)}% (min ${PUMP_FUN.MIN_BONDING_CURVE_PROGRESS}%)`);
+  if (progress < minProgress) {
+    failures.push(`Bonding curve too early: ${progress.toFixed(1)}% (min ${minProgress}%)`);
   }
   
-  if (progress > PUMP_FUN.MAX_BONDING_CURVE_PROGRESS) {
+  if (progress > maxProgress) {
     failures.push(`About to graduate: ${progress.toFixed(1)}% - migration risk`);
-  } else if (progress > PUMP_FUN.GRADUATION_WARNING_PERCENT) {
+  } else if (progress > 80) {
     warnings.push(`Near graduation: ${progress.toFixed(1)}% - be careful`);
   }
   
-  const progressInIdealRange = 
-    progress >= PUMP_FUN.IDEAL_PROGRESS_MIN && 
-    progress <= PUMP_FUN.IDEAL_PROGRESS_MAX;
-  
   logger.checklist(
-    `Bonding curve ${PUMP_FUN.MIN_BONDING_CURVE_PROGRESS}-${PUMP_FUN.MAX_BONDING_CURVE_PROGRESS}%`,
-    progress >= PUMP_FUN.MIN_BONDING_CURVE_PROGRESS && progress <= PUMP_FUN.MAX_BONDING_CURVE_PROGRESS,
-    `${progress.toFixed(1)}%${progressInIdealRange ? ' (ideal range!)' : ''}`
+    `Bonding curve ${minProgress}-${maxProgress}%`,
+    progress >= minProgress && progress <= maxProgress,
+    `${progress.toFixed(1)}%`
   );
   
-  // 3. Check market cap
-  if (token.marketCapUsd < PUMP_FUN.MIN_MARKET_CAP_USD) {
-    failures.push(`Market cap too low: $${token.marketCapUsd.toFixed(0)} (min $${PUMP_FUN.MIN_MARKET_CAP_USD})`);
+  // 3. Check market cap (use DISCOVERY_CONFIG for consistency)
+  const minMcap = DISCOVERY_CONFIG.minMarketCap;
+  const maxMcap = DISCOVERY_CONFIG.maxMarketCap;
+  
+  if (token.marketCapUsd < minMcap) {
+    failures.push(`Market cap too low: $${token.marketCapUsd.toFixed(0)} (min $${minMcap})`);
   }
   
-  if (token.marketCapUsd > PUMP_FUN.MAX_MARKET_CAP_USD) {
+  if (token.marketCapUsd > maxMcap) {
     warnings.push(`High market cap: $${token.marketCapUsd.toFixed(0)} - less upside potential`);
   }
   
   logger.checklist(
-    `Market cap ≥ $${PUMP_FUN.MIN_MARKET_CAP_USD}`,
-    token.marketCapUsd >= PUMP_FUN.MIN_MARKET_CAP_USD,
+    `Market cap ≥ $${minMcap}`,
+    token.marketCapUsd >= minMcap,
     `$${token.marketCapUsd.toFixed(0)}`
   );
   
-  // 4. Check age
-  if (token.ageMinutes < PUMP_FUN.BOT_WAR_ZONE_MINUTES) {
-    failures.push(`Too fresh: ${token.ageMinutes.toFixed(1)} min - BOT WAR ZONE`);
-  } else if (token.ageMinutes < PUMP_FUN.MIN_AGE_MINUTES) {
-    warnings.push(`Very new: ${token.ageMinutes.toFixed(1)} min - high risk`);
+  // 4. Check age (use DISCOVERY_CONFIG for consistency)
+  const minAge = DISCOVERY_CONFIG.minAgeMinutes;
+  const maxAge = DISCOVERY_CONFIG.maxAgeMinutes;
+  
+  if (token.ageMinutes < minAge) {
+    failures.push(`Too fresh: ${token.ageMinutes.toFixed(1)} min (min ${minAge} min)`);
   }
   
-  if (token.ageMinutes > PUMP_FUN.MAX_AGE_MINUTES) {
-    warnings.push(`Older token: ${token.ageMinutes.toFixed(0)} min - check momentum`);
+  if (token.ageMinutes > maxAge) {
+    failures.push(`Too old: ${token.ageMinutes.toFixed(1)} min (max ${maxAge} min)`);
   }
   
   logger.checklist(
-    `Age ≥ ${PUMP_FUN.MIN_AGE_MINUTES} min`,
-    token.ageMinutes >= PUMP_FUN.MIN_AGE_MINUTES,
+    `Age ${minAge}-${maxAge} min`,
+    token.ageMinutes >= minAge && token.ageMinutes <= maxAge,
     `${token.ageMinutes.toFixed(1)} min`
   );
   
   // 5. Check engagement (trade count)
-  if (token.replyCount < PUMP_FUN.MIN_REPLY_COUNT) {
+  const minTrades = DISCOVERY_CONFIG.minTradeCount;
+  if (token.replyCount < minTrades) {
     warnings.push(`Low engagement: ${token.replyCount} trades`);
   }
   
   logger.checklist(
-    `Engagement (≥ ${PUMP_FUN.MIN_REPLY_COUNT} trades)`,
-    token.replyCount >= PUMP_FUN.MIN_REPLY_COUNT,
+    `Engagement (≥ ${minTrades} trades)`,
+    token.replyCount >= minTrades,
     `${token.replyCount} trades`
   );
   
@@ -160,7 +164,7 @@ export async function checkPumpFunSafety(mintAddress: string): Promise<PumpFunSa
     [token.twitter && 'Twitter', token.telegram && 'TG', token.website && 'Web'].filter(Boolean).join(', ') || 'None'
   );
   
-  // 7. Analyze recent trades for manipulation
+  // 7. Analyze recent trades for manipulation (if available)
   const recentTrades = await fetchPumpFunTrades(mintAddress, 20);
   
   if (recentTrades.length > 0) {
@@ -188,9 +192,8 @@ export async function checkPumpFunSafety(mintAddress: string): Promise<PumpFunSa
       !creatorActivity.isSelling,
       creatorActivity.isSelling ? `Selling ${creatorActivity.sellPercent.toFixed(1)}%` : 'Holding'
     );
-  } else {
-    logger.checklist('Trade data', false, 'No recent trades available');
   }
+  // Skip trade analysis silently if no trades - engagement stats are enough
   
   // Final result
   const passed = failures.length === 0;
@@ -310,12 +313,12 @@ export async function quickPumpFunCheck(mintAddress: string): Promise<{
     return { isPumpFun: true, shouldAnalyze: false, reason: 'Graduated to Raydium' };
   }
   
-  if (token.ageMinutes < PUMP_FUN.BOT_WAR_ZONE_MINUTES) {
-    return { isPumpFun: true, shouldAnalyze: false, reason: 'Too fresh (bot war)' };
+  if (token.ageMinutes < DISCOVERY_CONFIG.minAgeMinutes) {
+    return { isPumpFun: true, shouldAnalyze: false, reason: `Too fresh (< ${DISCOVERY_CONFIG.minAgeMinutes} min)` };
   }
   
-  if (token.bondingCurveProgress < 10) {
-    return { isPumpFun: true, shouldAnalyze: false, reason: 'Too early in curve' };
+  if (token.bondingCurveProgress < DISCOVERY_CONFIG.minProgress) {
+    return { isPumpFun: true, shouldAnalyze: false, reason: `Too early (< ${DISCOVERY_CONFIG.minProgress}%)` };
   }
   
   return { isPumpFun: true, shouldAnalyze: true };
