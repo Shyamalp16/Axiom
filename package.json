@@ -17,7 +17,8 @@
     "paper:stats": "cross-env PAPER_TRADE=true tsx src/cli/paper-trade.ts stats",
     "paper:reset": "cross-env PAPER_TRADE=true tsx src/cli/paper-trade.ts reset",
     "paper:export": "cross-env PAPER_TRADE=true tsx src/cli/paper-trade.ts export",
-    "test:discovery": "tsx src/cli/test-discovery.ts"
+    "test:discovery": "tsx src/cli/test-discovery.ts",
+    "test:price": "tsx src/cli/test-price-monitor.ts"
   },
   "keywords": [
     "solana",

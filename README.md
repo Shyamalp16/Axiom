@@ -157,6 +157,9 @@ npm run test:setup
 # Test token discovery (polls for candidates, runs safety checks)
 npm run test:discovery
 
+# Test Price Monitoring
+npm run test:price
+
 # Paper trading (simulated trades)
 npm run paper              # Start paper trading
 npm run paper:check        # Check paper positions
