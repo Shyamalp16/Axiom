@@ -10,31 +10,43 @@
     "dev": "tsx watch src/index.ts",
     "bot": "tsx src/index.ts",
     "check": "tsx src/cli/check-token.ts",
-    "status": "tsx src/cli/status.ts"
+    "status": "tsx src/cli/status.ts",
+    "test:setup": "tsx src/cli/test-setup.ts",
+    "paper": "cross-env PAPER_TRADE=true tsx src/cli/paper-trade.ts",
+    "paper:check": "cross-env PAPER_TRADE=true tsx src/cli/paper-trade.ts check",
+    "paper:stats": "cross-env PAPER_TRADE=true tsx src/cli/paper-trade.ts stats",
+    "paper:reset": "cross-env PAPER_TRADE=true tsx src/cli/paper-trade.ts reset",
+    "paper:export": "cross-env PAPER_TRADE=true tsx src/cli/paper-trade.ts export"
   },
-  "keywords": ["solana", "trading", "memecoin", "bot"],
+  "keywords": [
+    "solana",
+    "trading",
+    "memecoin",
+    "bot"
+  ],
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "@solana/web3.js": "^1.95.0",
     "@solana/spl-token": "^0.4.6",
+    "@solana/web3.js": "^1.95.0",
     "bs58": "^5.0.0",
-    "dotenv": "^16.4.5",
     "chalk": "^5.3.0",
     "cli-table3": "^0.6.5",
-    "ora": "^8.0.1",
-    "inquirer": "^9.2.23",
-    "node-fetch": "^3.3.2",
-    "ws": "^8.17.0",
     "date-fns": "^3.6.0",
-    "lowdb": "^7.0.1"
+    "dotenv": "^16.4.5",
+    "inquirer": "^9.2.23",
+    "lowdb": "^7.0.1",
+    "node-fetch": "^3.3.2",
+    "ora": "^8.0.1",
+    "ws": "^8.17.0"
   },
   "devDependencies": {
+    "@types/inquirer": "^9.0.7",
     "@types/node": "^20.14.0",
     "@types/ws": "^8.5.10",
-    "@types/inquirer": "^9.0.7",
-    "typescript": "^5.4.5",
-    "tsx": "^4.15.0"
+    "cross-env": "^7.0.3",
+    "tsx": "^4.15.0",
+    "typescript": "^5.4.5"
   },
   "engines": {
     "node": ">=20.0.0"

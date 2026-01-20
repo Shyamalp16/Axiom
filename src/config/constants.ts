@@ -227,6 +227,21 @@ export const WEEKLY_LIMITS = {
 } as const;
 
 // ============================================
+// PAPER TRADING MODE
+// ============================================
+
+export const PAPER_TRADING = {
+  // Enable paper trading (no real transactions)
+  ENABLED: process.env.PAPER_TRADE === 'true',
+  
+  // Starting simulated balance
+  STARTING_BALANCE_SOL: 2.0,
+  
+  // Log level for paper trades
+  VERBOSE: true,
+} as const;
+
+// ============================================
 // TECHNICAL DEFAULTS
 // ============================================
 

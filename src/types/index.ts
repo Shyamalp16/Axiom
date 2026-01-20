@@ -22,7 +22,7 @@ export interface TokenSafetyResult {
   freezeAuthorityDisabled: boolean;
   transferTaxPercent: number;
   hasBlacklistWhitelist: boolean;
-  lpPlatform: 'raydium' | 'orca' | 'unknown';
+  lpPlatform: 'raydium' | 'orca' | 'pumpfun' | 'unknown';
   lpSolAmount: number;
   failures: string[];
 }

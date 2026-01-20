@@ -15,6 +15,7 @@ import {
   TIME_KILL_SWITCH,
   DAILY_LIMITS,
   WEEKLY_LIMITS,
+  PAPER_TRADING,
 } from './constants.js';
 
 // Re-export all constants
@@ -67,6 +68,7 @@ export const CONFIG = {
   timeKillSwitch: TIME_KILL_SWITCH,
   dailyLimits: DAILY_LIMITS,
   weeklyLimits: WEEKLY_LIMITS,
+  paperTrading: PAPER_TRADING,
   env: ENV,
 } as const;
 

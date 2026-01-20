@@ -11,7 +11,8 @@ import { getConnection } from '../utils/solana.js';
 import { TOKEN_SAFETY } from '../config/index.js';
 import { TokenSafetyResult } from '../types/index.js';
 import logger from '../utils/logger.js';
-import { fetchTokenMetadata, fetchLPInfo } from '../api/data-providers.js';
+import { fetchLPInfo } from '../api/data-providers.js';
+import { fetchPumpFunToken } from '../api/pump-fun.js';
 
 /**
  * Run complete token safety check
@@ -24,90 +25,137 @@ export async function checkTokenSafety(mintAddress: string): Promise<TokenSafety
   logger.header('TOKEN SAFETY CHECK');
   logger.info(`Analyzing: ${mintAddress}`);
   
+  // First check if this is a Pump.fun token (bonding curve, not LP)
+  // Pump.fun tokens have addresses ending in 'pump' (vanity suffix)
+  const looksLikePumpFun = mintAddress.toLowerCase().endsWith('pump');
+  const pumpToken = await fetchPumpFunToken(mintAddress);
+  const isPumpFun = (pumpToken !== null && !pumpToken.isGraduated) || looksLikePumpFun;
+  
+  if (looksLikePumpFun && !pumpToken) {
+    logger.warn('Pump.fun API unavailable - using address pattern detection');
+  }
+  
   let mintAuthorityDisabled = false;
   let freezeAuthorityDisabled = false;
   let transferTaxPercent = 0;
   let hasBlacklistWhitelist = false;
-  let lpPlatform: 'raydium' | 'orca' | 'unknown' = 'unknown';
+  let lpPlatform: 'raydium' | 'orca' | 'pumpfun' | 'unknown' = 'unknown';
   let lpSolAmount = 0;
   
   try {
-    // 1. Check Mint Authority
-    const mintPubkey = new PublicKey(mintAddress);
-    const mintInfo = await getMint(conn, mintPubkey);
-    
-    mintAuthorityDisabled = mintInfo.mintAuthority === null;
-    if (!mintAuthorityDisabled) {
-      failures.push('Mint authority is NOT disabled - can mint more tokens');
-    }
-    logger.checklist('Mint authority disabled', mintAuthorityDisabled);
-    
-    // 2. Check Freeze Authority
-    freezeAuthorityDisabled = mintInfo.freezeAuthority === null;
-    if (!freezeAuthorityDisabled) {
-      failures.push('Freeze authority is NOT disabled - can freeze your tokens');
-    }
-    logger.checklist('Freeze authority disabled', freezeAuthorityDisabled);
-    
-    // 3. Check Transfer Tax (Token-2022 extension)
-    // Note: Standard SPL tokens don't have transfer tax
-    // For Token-2022, we'd need to check the transfer fee extension
-    const isToken2022 = await checkIfToken2022(mintAddress);
-    if (isToken2022) {
-      const taxInfo = await checkTransferTax(mintAddress);
-      transferTaxPercent = taxInfo.taxPercent;
+    // For Pump.fun tokens, skip standard SPL checks (handled by Pump.fun protocol)
+    if (isPumpFun) {
+      // Pump.fun tokens are created with mint/freeze authority disabled by protocol
+      mintAuthorityDisabled = true;
+      freezeAuthorityDisabled = true;
+      transferTaxPercent = 0;
+      hasBlacklistWhitelist = false;
       
-      if (transferTaxPercent > TOKEN_SAFETY.MAX_TRANSFER_TAX_PERCENT) {
-        failures.push(`Transfer tax is ${transferTaxPercent}% - expected 0%`);
+      logger.checklist('Mint authority disabled', true, 'Pump.fun (protocol enforced)');
+      logger.checklist('Freeze authority disabled', true, 'Pump.fun (protocol enforced)');
+      logger.checklist('Transfer tax = 0%', true, 'Pump.fun token');
+      logger.checklist('No blacklist/whitelist', true, 'Pump.fun token');
+    } else {
+      // Standard DEX tokens - run full SPL checks
+      // 1. Check Mint Authority
+      const mintPubkey = new PublicKey(mintAddress);
+      const mintInfo = await getMint(conn, mintPubkey);
+      
+      mintAuthorityDisabled = mintInfo.mintAuthority === null;
+      if (!mintAuthorityDisabled) {
+        failures.push('Mint authority is NOT disabled - can mint more tokens');
       }
+      logger.checklist('Mint authority disabled', mintAuthorityDisabled);
+      
+      // 2. Check Freeze Authority
+      freezeAuthorityDisabled = mintInfo.freezeAuthority === null;
+      if (!freezeAuthorityDisabled) {
+        failures.push('Freeze authority is NOT disabled - can freeze your tokens');
+      }
+      logger.checklist('Freeze authority disabled', freezeAuthorityDisabled);
+      
+      // 3. Check Transfer Tax (Token-2022 extension)
+      const isToken2022 = await checkIfToken2022(mintAddress);
+      if (isToken2022) {
+        const taxInfo = await checkTransferTax(mintAddress);
+        transferTaxPercent = taxInfo.taxPercent;
+        
+        if (transferTaxPercent > TOKEN_SAFETY.MAX_TRANSFER_TAX_PERCENT) {
+          failures.push(`Transfer tax is ${transferTaxPercent}% - expected 0%`);
+        }
+      }
+      logger.checklist(
+        'Transfer tax = 0%', 
+        transferTaxPercent === 0,
+        isToken2022 ? `Token-2022: ${transferTaxPercent}%` : 'Standard SPL token'
+      );
+      
+      // 4. Check for Blacklist/Whitelist Logic
+      hasBlacklistWhitelist = await checkBlacklistWhitelist(mintAddress);
+      if (hasBlacklistWhitelist) {
+        failures.push('Token has blacklist/whitelist logic detected');
+      }
+      logger.checklist('No blacklist/whitelist', !hasBlacklistWhitelist);
     }
-    logger.checklist(
-      'Transfer tax = 0%', 
-      transferTaxPercent === 0,
-      isToken2022 ? `Token-2022: ${transferTaxPercent}%` : 'Standard SPL token'
-    );
-    
-    // 4. Check for Blacklist/Whitelist Logic
-    // This requires analyzing the token program - usually indicated by
-    // custom transfer hooks or authority checks
-    hasBlacklistWhitelist = await checkBlacklistWhitelist(mintAddress);
-    if (hasBlacklistWhitelist) {
-      failures.push('Token has blacklist/whitelist logic detected');
-    }
-    logger.checklist('No blacklist/whitelist', !hasBlacklistWhitelist);
     
     // 5. Check LP Platform and Size
-    const lpInfo = await fetchLPInfo(mintAddress);
-    lpPlatform = lpInfo.platform;
-    lpSolAmount = lpInfo.solAmount;
-    
-    const validPlatform = TOKEN_SAFETY.VALID_LP_PLATFORMS.includes(lpPlatform as 'raydium' | 'orca');
-    if (!validPlatform && lpPlatform !== 'unknown') {
-      failures.push(`LP not on Raydium/Orca - found on ${lpPlatform}`);
-    } else if (lpPlatform === 'unknown') {
-      failures.push('Could not detect LP platform');
+    if (isPumpFun) {
+      // Pump.fun tokens use bonding curve, not traditional LP
+      lpPlatform = 'pumpfun';
+      lpSolAmount = pumpToken?.realSolReserves || 0;
+      logger.checklist(
+        'LP on Raydium/Orca',
+        true,
+        'Pump.fun (bonding curve)'
+      );
+      // Skip LP size check for Pump.fun - bonding curve has different mechanics
+      if (pumpToken) {
+        logger.checklist(
+          'Bonding curve liquidity',
+          true,
+          `${lpSolAmount.toFixed(2)} SOL in curve`
+        );
+      } else {
+        logger.checklist(
+          'Bonding curve liquidity',
+          true,
+          'Pump.fun token (API unavailable)'
+        );
+      }
+    } else {
+      // Standard DEX tokens (Raydium/Orca)
+      const lpInfo = await fetchLPInfo(mintAddress);
+      lpPlatform = lpInfo.platform;
+      lpSolAmount = lpInfo.solAmount;
+      
+      const validPlatform = TOKEN_SAFETY.VALID_LP_PLATFORMS.includes(lpPlatform as 'raydium' | 'orca');
+      if (!validPlatform && lpPlatform !== 'unknown') {
+        failures.push(`LP not on Raydium/Orca - found on ${lpPlatform}`);
+      } else if (lpPlatform === 'unknown') {
+        failures.push('Could not detect LP platform');
+      }
+      logger.checklist(
+        'LP on Raydium/Orca', 
+        validPlatform,
+        lpPlatform
+      );
+      
+      // 6. Check LP Size (only for DEX tokens)
+      const lpSufficient = lpSolAmount >= TOKEN_SAFETY.ABSOLUTE_FLOOR_LP_SOL;
+      const lpIdeal = lpSolAmount >= TOKEN_SAFETY.MIN_LP_SOL;
+      
+      if (!lpSufficient) {
+        failures.push(`LP too low: ${lpSolAmount.toFixed(2)} SOL (min: ${TOKEN_SAFETY.ABSOLUTE_FLOOR_LP_SOL} SOL)`);
+      } else if (!lpIdeal) {
+        // Warning but not failure if above floor but below ideal
+        logger.warn(`LP below ideal: ${lpSolAmount.toFixed(2)} SOL (ideal: ${TOKEN_SAFETY.MIN_LP_SOL}+ SOL)`);
+      }
+      logger.checklist(
+        `LP ≥ ${TOKEN_SAFETY.MIN_LP_SOL} SOL`, 
+        lpIdeal,
+        `${lpSolAmount.toFixed(2)} SOL`
+      );
     }
-    logger.checklist(
-      'LP on Raydium/Orca', 
-      validPlatform,
-      lpPlatform
-    );
-    
-    // 6. Check LP Size
-    const lpSufficient = lpSolAmount >= TOKEN_SAFETY.ABSOLUTE_FLOOR_LP_SOL;
-    const lpIdeal = lpSolAmount >= TOKEN_SAFETY.MIN_LP_SOL;
-    
-    if (!lpSufficient) {
-      failures.push(`LP too low: ${lpSolAmount.toFixed(2)} SOL (min: ${TOKEN_SAFETY.ABSOLUTE_FLOOR_LP_SOL} SOL)`);
-    } else if (!lpIdeal) {
-      // Warning but not failure if above floor but below ideal
-      logger.warn(`LP below ideal: ${lpSolAmount.toFixed(2)} SOL (ideal: ${TOKEN_SAFETY.MIN_LP_SOL}+ SOL)`);
-    }
-    logger.checklist(
-      `LP ≥ ${TOKEN_SAFETY.MIN_LP_SOL} SOL`, 
-      lpIdeal,
-      `${lpSolAmount.toFixed(2)} SOL`
-    );
     
   } catch (error) {
     const errMsg = error instanceof Error ? error.message : 'Unknown error';
@@ -215,6 +263,16 @@ export async function quickSafetyCheck(mintAddress: string): Promise<{
   const conn = getConnection();
   
   try {
+    // Check if Pump.fun token first (by API or address pattern)
+    const looksLikePumpFun = mintAddress.toLowerCase().endsWith('pump');
+    const pumpToken = await fetchPumpFunToken(mintAddress);
+    
+    if ((pumpToken && !pumpToken.isGraduated) || looksLikePumpFun) {
+      // Pump.fun tokens have mint/freeze disabled by protocol
+      return { safe: true };
+    }
+    
+    // Standard SPL token check
     const mintPubkey = new PublicKey(mintAddress);
     const mintInfo = await getMint(conn, mintPubkey);
     

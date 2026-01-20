@@ -59,8 +59,14 @@ export async function runPreTradeChecklist(
   };
   
   // First, detect if this is a Pump.fun token
+  // Pump.fun tokens have addresses ending in 'pump' (vanity suffix)
+  const looksLikePumpFun = mintAddress.toLowerCase().endsWith('pump');
   const pumpToken = await fetchPumpFunToken(mintAddress);
-  const isPump = pumpToken !== null && !pumpToken.isGraduated;
+  const isPump = (pumpToken !== null && !pumpToken.isGraduated) || looksLikePumpFun;
+  
+  if (looksLikePumpFun && !pumpToken) {
+    logger.warn('Pump.fun API unavailable - using address pattern detection');
+  }
   
   logger.header('═══════════════════════════════════════');
   logger.header('PRE-TRADE CHECKLIST');

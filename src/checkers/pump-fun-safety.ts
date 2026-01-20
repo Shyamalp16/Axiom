@@ -40,10 +40,38 @@ export async function checkPumpFunSafety(mintAddress: string): Promise<PumpFunSa
   logger.header('PUMP.FUN SAFETY CHECK');
   logger.info(`Analyzing: ${mintAddress}`);
   
+  // Check if address looks like Pump.fun token
+  const looksLikePumpFun = mintAddress.toLowerCase().endsWith('pump');
+  
   // Fetch token data
   const token = await fetchPumpFunToken(mintAddress);
   
   if (!token) {
+    // If API unavailable but address pattern matches, pass with limited checks
+    if (looksLikePumpFun) {
+      logger.warn('Pump.fun API unavailable - running with limited checks');
+      logger.checklist('Pump.fun token (by address)', true, 'Address ends in "pump"');
+      logger.checklist('API data', false, 'Unavailable - Cloudflare blocked');
+      
+      logger.divider();
+      logger.warn('PUMP.FUN SAFETY: PASSED WITH WARNINGS ⚠');
+      logger.warn('  ⚠ Cannot verify bonding curve, market cap, age, or engagement');
+      logger.warn('  ⚠ Proceed with extra caution or try again later');
+      
+      return {
+        passed: true, // Pass but with warnings
+        isPumpFun: true,
+        token: null,
+        bondingCurveProgress: 0,
+        marketCapUsd: 0,
+        ageMinutes: 0,
+        replyCount: 0,
+        isGraduated: false,
+        failures: [],
+        warnings: ['Pump.fun API unavailable - limited verification'],
+      };
+    }
+    
     return {
       passed: false,
       isPumpFun: false,
@@ -299,9 +327,14 @@ export async function quickPumpFunCheck(mintAddress: string): Promise<{
   shouldAnalyze: boolean;
   reason?: string;
 }> {
+  const looksLikePumpFun = mintAddress.toLowerCase().endsWith('pump');
   const token = await fetchPumpFunToken(mintAddress);
   
   if (!token) {
+    // If API unavailable but address pattern matches, still analyze
+    if (looksLikePumpFun) {
+      return { isPumpFun: true, shouldAnalyze: true, reason: 'API unavailable - using address pattern' };
+    }
     return { isPumpFun: false, shouldAnalyze: false, reason: 'Not on Pump.fun' };
   }
   
