@@ -395,10 +395,11 @@ export interface AxiomTrendingToken {
 
 /**
  * Get trending meme tokens
- * @param timePeriod - '1h', '24h', '7d', or '30d'
+ * @param timePeriod - '1h', '24h', '7d', or '30d' (confirmed working)
+ * Note: '1m' return 500 error - not supported by API
  */
 export async function getAxiomTrending(
-  timePeriod: '1h' | '24h' | '7d' | '30d' = '1h'
+  timePeriod: '1m' | '5m' | '1h' | '24h' | '7d' | '30d' = '1h'
 ): Promise<AxiomTrendingToken[]> {
   const token = await getAccessToken();
   
@@ -410,7 +411,9 @@ export async function getAxiomTrending(
   });
   
   if (!response.ok) {
-    throw new Error(`Axiom trending API error: ${response.status}`);
+    const errorText = await response.text().catch(() => '');
+    // Note: Only 1h, 24h, 7d, 30d are confirmed working. 1m/5m may return 500.
+    throw new Error(`Axiom trending API error: ${response.status} (timePeriod=${timePeriod}) ${errorText.slice(0, 100)}`);
   }
   
   return response.json() as Promise<AxiomTrendingToken[]>;

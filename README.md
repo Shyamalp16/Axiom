@@ -160,6 +160,33 @@ npm run paper:reset        # Reset paper portfolio (default 2 SOL)
 npm run paper:export       # Export paper trades to CSV
 ```
 
+### Axiom Auto-Trading (Alternative Data Source)
+
+Uses Axiom Trade API for token discovery instead of pump.fun:
+
+```bash
+npm run axiom:auto         # Start Axiom paper trading
+npm run axiom:status       # Show paper trading status
+npm run test:axiom         # Test Axiom API connection
+```
+
+**Keyboard Controls** (while `axiom:auto` is running):
+
+| Key | Action |
+|-----|--------|
+| `x` | Exit current position manually |
+| `s` | Show quick status |
+| `h` | Show help |
+| `Ctrl+C` | Stop the bot |
+
+**Requirements**: Add Axiom auth tokens to `.env`:
+```env
+AXIOM_ACCESS_TOKEN=your_access_token
+AXIOM_REFRESH_TOKEN=your_refresh_token
+```
+
+Get tokens from https://axiom.trade → DevTools (F12) → Application → Cookies
+
 ### Utilities
 
 ```bash
