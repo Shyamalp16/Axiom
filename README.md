@@ -195,6 +195,7 @@ npm run status             # View bot status & stats
 npm run test:setup         # Test wallet and RPC connection
 npm run test:discovery     # Test token discovery (no trades)
 npm run test:price         # Test price monitoring
+npm run test:axiom
 ```
 
 ### Development
@@ -324,3 +325,4 @@ MIT
 ---
 
 *Built for survival in the memecoin trenches. Stay disciplined.* 🎯
+
