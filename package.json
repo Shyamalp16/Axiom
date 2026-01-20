@@ -20,7 +20,8 @@
     "paper:auto": "cross-env PAPER_TRADE=true tsx src/cli/auto-trade.ts start",
     "auto": "tsx src/cli/auto-trade.ts start",
     "test:discovery": "tsx src/cli/test-discovery.ts",
-    "test:price": "tsx src/cli/test-price-monitor.ts"
+    "test:price": "tsx src/cli/test-price-monitor.ts",
+    "test:axiom": "tsx src/cli/test-axiom.ts"
   },
   "keywords": [
     "solana",

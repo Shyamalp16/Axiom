@@ -2,3 +2,4 @@
 export * from './data-providers.js';
 export * from './pump-fun.js';
 export * from './pump-portal.js';
+export * from './axiom-trade.js';
