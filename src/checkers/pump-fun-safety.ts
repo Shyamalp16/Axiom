@@ -43,8 +43,8 @@ export async function checkPumpFunSafety(mintAddress: string): Promise<PumpFunSa
   logger.header('PUMP.FUN SAFETY CHECK');
   logger.info(`Analyzing: ${mintAddress}`);
   
-  // Fetch token data via PumpPortal
-  const token = await fetchPumpFunToken(mintAddress);
+  // Fetch FRESH token data via PumpPortal (skip cache to avoid stale data)
+  const token = await fetchPumpFunToken(mintAddress, true);
   
   if (!token) {
     logger.error('Failed to fetch token data from PumpPortal');

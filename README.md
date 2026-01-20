@@ -139,40 +139,44 @@ BIRDEYE_API_KEY=your_birdeye_api_key
 
 ## Usage
 
-### Commands
+### Auto-Trading (Autonomous Mode)
 
 ```bash
-# Interactive bot mode
-npm run bot
+# Start autonomous trading (PAPER MODE - no real transactions)
+npm run paper:auto
 
-# Check a specific token (no trade)
-npm run check <mint_address>
+# Start autonomous trading (LIVE MODE - real transactions)
+npm run auto
+```
 
-# View status & stats
-npm run status
+**Paper mode** discovers tokens, runs full safety checks, and simulates trades without touching your wallet. Perfect for testing and validating the strategy.
 
-# Test setup/connection
-npm run test:setup
+### Paper Trading (Interactive)
 
-# Test token discovery (polls for candidates, runs safety checks)
-npm run test:discovery
+```bash
+npm run paper              # Interactive paper trading menu
+npm run paper:stats        # View paper trading statistics
+npm run paper:reset        # Reset paper portfolio (default 2 SOL)
+npm run paper:export       # Export paper trades to CSV
+```
 
-# Test Price Monitoring
-npm run test:price
+### Utilities
 
-# Paper trading (simulated trades)
-npm run paper              # Start paper trading
-npm run paper:check        # Check paper positions
-npm run paper:stats        # View paper trading stats
-npm run paper:reset        # Reset paper trading data
-npm run paper:export       # Export paper trade history
+```bash
+npm run check              # Check a specific token's safety
+npm run status             # View bot status & stats
+npm run test:setup         # Test wallet and RPC connection
+npm run test:discovery     # Test token discovery (no trades)
+npm run test:price         # Test price monitoring
+```
 
-# Development mode (hot reload)
-npm run dev
+### Development
 
-# Build for production
-npm run build
-npm run start
+```bash
+npm run bot                # Interactive bot mode
+npm run dev                # Development mode (hot reload)
+npm run build              # Build for production
+npm run start              # Run production build
 ```
 
 ## Project Structure

@@ -10,9 +10,11 @@
 
 import { LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { Position, OrderReason } from '../types/index.js';
-import { STOP_LOSS, TAKE_PROFIT, TIME_KILL_SWITCH } from '../config/index.js';
+import { STOP_LOSS, TAKE_PROFIT, TIME_KILL_SWITCH, PAPER_TRADING } from '../config/index.js';
 import { subscribeTokenTrades, PumpPortalTrade, getSolPrice } from '../api/pump-portal.js';
 import { updatePosition, closePosition, getPosition } from '../trading/position-manager.js';
+import { paperSell, getPaperPortfolio } from '../trading/paper-trader.js';
+import { candidateQueue } from '../discovery/candidate-queue.js';
 import { sellOnPumpFun } from '../api/pump-fun.js';
 import { executeSell } from '../trading/executor.js';
 import logger from '../utils/logger.js';
@@ -78,9 +80,11 @@ export class PriceMonitor {
     }
     
     logger.info(`Starting price monitor for ${position.symbol} (${mint.slice(0, 8)}...)`);
+    logger.debug(`Subscribing to trade events for mint: ${mint}`);
     
     // Subscribe to trade events for this token
     const unsubscribe = subscribeTokenTrades([mint], (trade: PumpPortalTrade) => {
+      logger.debug(`Trade event received for ${position.symbol}: ${trade.txType} ${trade.tokenAmount} tokens`);
       this.handleTradeEvent(mint, trade);
     });
     
@@ -144,13 +148,33 @@ export class PriceMonitor {
    */
   private async handleTradeEvent(mint: string, trade: PumpPortalTrade): Promise<void> {
     const monitored = this.monitored.get(mint);
-    if (!monitored) return;
-    
-    // Get latest position state from position manager
-    const position = getPosition(monitored.position.id);
-    if (!position || position.status === 'closed') {
-      this.stopMonitoring(mint);
+    if (!monitored) {
+      logger.debug(`Trade event for unmonitored token: ${mint.slice(0, 8)}...`);
       return;
+    }
+    
+    // Get latest position state
+    let position: Position;
+    
+    if (PAPER_TRADING.ENABLED) {
+      // Paper trading: check if position still exists in paper portfolio
+      const portfolio = getPaperPortfolio();
+      const paperPos = portfolio.positions.get(mint);
+      if (!paperPos) {
+        logger.warn(`📝 [PAPER] Position not found in portfolio for ${mint.slice(0, 8)}... - stopping monitor`);
+        this.stopMonitoring(mint);
+        return;
+      }
+      // Use the monitored position (we update it locally)
+      position = monitored.position;
+    } else {
+      // Real trading: get from position manager
+      const realPosition = getPosition(monitored.position.id);
+      if (!realPosition || realPosition.status === 'closed') {
+        this.stopMonitoring(mint);
+        return;
+      }
+      position = realPosition;
     }
     
     // Calculate current price from bonding curve reserves
@@ -308,6 +332,13 @@ export class PriceMonitor {
       const isStopLoss = reason.includes('stop');
       logger.alert(isStopLoss ? 'danger' : 'info', message);
       
+      // Paper trading mode
+      if (PAPER_TRADING.ENABLED) {
+        await this.executePaperExit(mint, position, reason, percentToSell);
+        return;
+      }
+      
+      // Real trading mode
       // Calculate amount to sell
       const quantityToSell = position.quantity * (percentToSell / 100);
       
@@ -332,12 +363,56 @@ export class PriceMonitor {
         // Stop monitoring if position fully closed
         if (percentToSell >= 100) {
           this.stopMonitoring(mint);
+          // Mark token as recently traded to prevent re-entry
+          candidateQueue.markRejected(mint, `recently_exited_${reason}`);
         }
       } else {
         logger.error(`Exit failed: ${result.error}`);
       }
     } catch (error) {
       logger.error(`Exit execution error: ${error}`);
+    } finally {
+      this.isProcessingExit.set(mint, false);
+    }
+  }
+  
+  /**
+   * Execute a paper trading exit (simulation)
+   */
+  private async executePaperExit(
+    mint: string,
+    position: Position,
+    reason: OrderReason,
+    percentToSell: number
+  ): Promise<void> {
+    try {
+      // Execute paper sell
+      const paperTrade = await paperSell(
+        mint,
+        position.symbol,
+        percentToSell,
+        reason
+      );
+      
+      if (paperTrade) {
+        const pnl = paperTrade.pnl || 0;
+        logger.success(`📝 [PAPER] Exit executed: ${reason} - PnL: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} SOL`);
+        
+        // Callback
+        this.callbacks.onExitExecuted?.(mint, reason, pnl);
+        
+        // Stop monitoring if position fully closed
+        if (percentToSell >= 100) {
+          this.stopMonitoring(mint);
+          // Mark token as recently traded to prevent re-entry
+          candidateQueue.markRejected(mint, `recently_exited_${reason}`);
+          logger.info(`📝 Token ${position.symbol} marked for cooldown (no re-entry for 15 min)`);
+        }
+      } else {
+        logger.warn(`📝 [PAPER] No position found to sell for ${position.symbol}`);
+      }
+    } catch (error) {
+      logger.error(`📝 [PAPER] Exit execution error: ${error}`);
     } finally {
       this.isProcessingExit.set(mint, false);
     }

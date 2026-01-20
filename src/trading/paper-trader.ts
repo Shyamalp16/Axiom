@@ -173,6 +173,9 @@ export async function paperBuy(
   let pricePerToken: number;
   let platform: 'pump.fun' | 'jupiter';
   
+  // Use lower slippage for paper trading (realistic price impact only)
+  const buySlippage = SLIPPAGE.PAPER_BUY_SLIPPAGE_PERCENT;
+  
   if (isPump && pumpToken) {
     // Pump.fun bonding curve
     platform = 'pump.fun';
@@ -189,7 +192,7 @@ export async function paperBuy(
     if (hasValidReserves) {
       const quote = calculatePumpFunBuyQuote(pumpToken, solAmount);
       logger.info(`📝 [PAPER] Buy Quote: ${solAmount} SOL → ${quote.tokenAmount.toFixed(2)} tokens (impact: ${quote.priceImpact.toFixed(2)}%)`);
-      tokenAmount = quote.tokenAmount * (1 - SLIPPAGE.BUY_SLIPPAGE_PERCENT / 100); // Apply slippage
+      tokenAmount = quote.tokenAmount * (1 - buySlippage / 100); // Apply paper slippage
       pricePerToken = tokenAmount > 0 ? solAmount / tokenAmount : pumpToken.priceSol;
     } else {
       // Fallback: Reserves invalid, use spot price or market cap estimate
@@ -219,7 +222,7 @@ export async function paperBuy(
         logger.error(`📝 [PAPER] No valid price data! Using fallback: ${pricePerToken.toExponential(4)} SOL/token`);
       }
       
-      tokenAmount = (solAmount / pricePerToken) * (1 - SLIPPAGE.BUY_SLIPPAGE_PERCENT / 100);
+      tokenAmount = (solAmount / pricePerToken) * (1 - buySlippage / 100);
       logger.info(`📝 [PAPER] Buy (estimated): ${solAmount} SOL → ${tokenAmount.toFixed(2)} tokens @ ${pricePerToken.toExponential(4)} SOL`);
     }
   } else {
@@ -227,7 +230,7 @@ export async function paperBuy(
     platform = 'jupiter';
     const marketData = await fetchMarketData(mint);
     pricePerToken = marketData.priceSol;
-    tokenAmount = (solAmount / pricePerToken) * (1 - SLIPPAGE.BUY_SLIPPAGE_PERCENT / 100);
+    tokenAmount = (solAmount / pricePerToken) * (1 - buySlippage / 100);
   }
   
   // Simulate fees
@@ -245,7 +248,7 @@ export async function paperBuy(
     tokenAmount,
     pricePerToken,
     estimatedFees,
-    slippageApplied: SLIPPAGE.BUY_SLIPPAGE_PERCENT,
+    slippageApplied: buySlippage,
     entryPrice: pricePerToken,
     checklistPassed,
     status: 'open',
@@ -272,6 +275,7 @@ export async function paperBuy(
       costBasis: solAmount,
       entryTime: new Date(),
     });
+    logger.debug(`📝 [PAPER] Position added to portfolio: ${symbol} (${mint.slice(0,8)}...) - Total positions: ${portfolio.positions.size}`);
   }
   
   paperTrades.push(trade);
@@ -319,6 +323,9 @@ export async function paperSell(
   let pricePerToken: number;
   let platform: 'pump.fun' | 'jupiter';
   
+  // Use lower slippage for paper trading (realistic price impact only)
+  const sellSlippage = SLIPPAGE.PAPER_SELL_SLIPPAGE_PERCENT;
+  
   if (isPump && pumpToken) {
     platform = 'pump.fun';
     
@@ -334,7 +341,7 @@ export async function paperSell(
     if (hasValidReserves) {
       const quote = calculatePumpFunSellQuote(pumpToken, tokenAmount);
       logger.info(`📝 [PAPER] Sell Quote: ${tokenAmount.toFixed(2)} tokens → ${quote.solAmount.toFixed(6)} SOL (impact: ${quote.priceImpact.toFixed(2)}%)`);
-      solReceived = quote.solAmount * (1 - SLIPPAGE.SELL_SLIPPAGE_PERCENT / 100);
+      solReceived = quote.solAmount * (1 - sellSlippage / 100);
       pricePerToken = tokenAmount > 0 ? quote.solAmount / tokenAmount : pumpToken.priceSol;
     } else {
       // Fallback: Reserves invalid, try multiple price sources
@@ -362,16 +369,16 @@ export async function paperSell(
         logger.error(`📝 [PAPER] No valid price data! Using fallback: ${pricePerToken.toExponential(4)} SOL/token`);
       }
       
-      solReceived = (tokenAmount * pricePerToken) * (1 - SLIPPAGE.SELL_SLIPPAGE_PERCENT / 100);
+      solReceived = (tokenAmount * pricePerToken) * (1 - sellSlippage / 100);
       logger.info(`📝 [PAPER] Sell (estimated): ${tokenAmount.toFixed(2)} tokens × ${pricePerToken.toExponential(4)} SOL = ${solReceived.toFixed(6)} SOL`);
     }
     
-    logger.info(`📝 [PAPER] After ${SLIPPAGE.SELL_SLIPPAGE_PERCENT}% slippage: ${solReceived.toFixed(6)} SOL`);
+    logger.info(`📝 [PAPER] After ${sellSlippage}% slippage: ${solReceived.toFixed(6)} SOL`);
   } else {
     platform = 'jupiter';
     const marketData = await fetchMarketData(mint);
     pricePerToken = marketData.priceSol;
-    solReceived = (tokenAmount * pricePerToken) * (1 - SLIPPAGE.SELL_SLIPPAGE_PERCENT / 100);
+    solReceived = (tokenAmount * pricePerToken) * (1 - sellSlippage / 100);
   }
   
   // Simulate fees (optional for paper trading)
@@ -401,7 +408,7 @@ export async function paperSell(
     tokenAmount,
     pricePerToken,
     estimatedFees: feesApplied,
-    slippageApplied: SLIPPAGE.SELL_SLIPPAGE_PERCENT,
+    slippageApplied: sellSlippage,
     entryPrice: position.avgEntryPrice,
     exitPrice: pricePerToken,
     pnl: netPnl,

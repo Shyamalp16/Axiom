@@ -250,6 +250,13 @@ export function getActivePositions(): Position[] {
 }
 
 /**
+ * Get position by ID
+ */
+export function getPosition(positionId: string): Position | undefined {
+  return activePositions.find(p => p.id === positionId);
+}
+
+/**
  * Get position by mint address
  */
 export function getPositionByMint(mint: string): Position | undefined {

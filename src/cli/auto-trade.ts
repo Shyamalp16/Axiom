@@ -152,26 +152,30 @@ async function showHelp(): Promise<void> {
 ║               AXIOM AUTO-TRADER CLI                           ║
 ╠═══════════════════════════════════════════════════════════════╣
 ║                                                               ║
-║  Usage: npx ts-node src/cli/auto-trade.ts <command>           ║
-║                                                               ║
 ║  Commands:                                                    ║
-║    start      Start autonomous trading                        ║
-║    status     Show current bot status                         ║
-║    stop       Send stop signal to running bot                 ║
-║    positions  Show active positions                           ║
-║    stats      Show trading statistics                         ║
-║    help       Show this help message                          ║
+║    npm run auto         Start autonomous trading (LIVE)       ║
+║    npm run paper:auto   Start autonomous trading (PAPER)      ║
 ║                                                               ║
-║  Examples:                                                    ║
-║    npx ts-node src/cli/auto-trade.ts start                    ║
-║    npx ts-node src/cli/auto-trade.ts status                   ║
+║  Paper Trading (Interactive):                                 ║
+║    npm run paper        Interactive paper trading             ║
+║    npm run paper:stats  View paper trading statistics         ║
+║    npm run paper:reset  Reset paper trading history           ║
+║    npm run paper:export Export paper trades to CSV            ║
 ║                                                               ║
-║  Environment Variables Required:                              ║
+║  Utilities:                                                   ║
+║    npm run check        Check a specific token                ║
+║    npm run status       Show bot status                       ║
+║    npm run test:setup   Test wallet and RPC setup             ║
+║                                                               ║
+║  Environment Variables Required (.env):                       ║
 ║    SOLANA_RPC_URL       - Solana RPC endpoint                 ║
 ║    WALLET_PRIVATE_KEY   - Base58 encoded private key          ║
+║    HELIUS_API_KEY       - Helius API key (or BIRDEYE)         ║
 ║                                                               ║
-║  Optional:                                                    ║
-║    PAPER_TRADE=true     - Enable paper trading mode           ║
+║  Paper Trading Mode:                                          ║
+║    Simulates all trades without real transactions.            ║
+║    Perfect for testing strategies risk-free.                  ║
+║    Paper portfolio starts with 2 SOL by default.              ║
 ║                                                               ║
 ╚═══════════════════════════════════════════════════════════════╝
 `);

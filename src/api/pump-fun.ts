@@ -122,8 +122,10 @@ export function isPumpFunApiConnected(): boolean {
 
 /**
  * Fetch token data from PumpPortal
+ * @param mintAddress - Token mint address
+ * @param forceRefresh - Skip cache and fetch fresh data
  */
-export async function fetchPumpFunToken(mintAddress: string): Promise<PumpFunToken | null> {
+export async function fetchPumpFunToken(mintAddress: string, forceRefresh: boolean = false): Promise<PumpFunToken | null> {
   try {
     // Ensure connected
     if (!isConnectedToPumpPortal()) {
@@ -131,10 +133,10 @@ export async function fetchPumpFunToken(mintAddress: string): Promise<PumpFunTok
     }
     
     // Get from cache or fetch via subscription
-    let portalToken = getCachedToken(mintAddress);
+    let portalToken = forceRefresh ? null : getCachedToken(mintAddress);
     
     if (!portalToken) {
-      // Subscribe to get data
+      // Subscribe to get data (this will also refresh the cache)
       portalToken = await fetchTokenViaPumpPortal(mintAddress, 5000);
     }
     

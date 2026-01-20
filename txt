@@ -1,0 +1,4 @@
+add a blocklist.
+UI
+add another pipeline wiht https://pypi.org/project/axiomtradeapi/ or https://github.com/vibheksoni/axiomtrade-rs?tab=readme-ov-file
+exit switch.

@@ -15,10 +15,16 @@ import {
   calculateTradeSize, 
   createPosition, 
   isTradingAllowed,
-  getActivePositions,
-  Position 
+  getActivePositions
 } from '../trading/position-manager.js';
+import { Position } from '../types/index.js';
 import { executeBuy } from '../trading/executor.js';
+import { 
+  paperBuy,
+  getPaperPortfolio,
+  loadPaperTrades,
+  PaperPosition
+} from '../trading/paper-trader.js';
 import { 
   generateEntrySignal, 
   displayEntrySignal,
@@ -27,7 +33,7 @@ import {
 import { fetchTokenInfo } from '../api/data-providers.js';
 import { startTokenMonitoring } from '../monitoring/dev-wallet-monitor.js';
 import { CandidateQueue } from '../discovery/candidate-queue.js';
-import { CONFIG } from '../config/index.js';
+import { CONFIG, PAPER_TRADING, POSITION_SIZING } from '../config/index.js';
 import logger from '../utils/logger.js';
 
 // Pipeline configuration
@@ -120,6 +126,18 @@ export class TradePipeline {
       // STAGE 1: Check if we can trade at all
       const canTradeResult = await this.canTrade();
       if (!canTradeResult.allowed) {
+        // Trade cooldown is temporary - don't permanently reject the token
+        // Just skip it for now, it will be picked up again after cooldown
+        if (canTradeResult.reason?.includes('cooldown')) {
+          logger.warn(`SKIPPED: ${symbol} - ${canTradeResult.reason} (will retry)`);
+          return {
+            mint,
+            symbol,
+            entered: false,
+            rejected: false, // Not rejected - just skipped
+            reason: canTradeResult.reason,
+          };
+        }
         return this.reject(mint, symbol, canTradeResult.reason || 'Trading not allowed');
       }
       
@@ -143,16 +161,33 @@ export class TradePipeline {
       
       // STAGE 4: Calculate trade size
       logger.info('[3/4] Calculating trade size...');
-      const sizeResult = await calculateTradeSize();
       
-      if (!sizeResult.allowed) {
-        return this.reject(mint, symbol, sizeResult.reason || 'Trade size not allowed');
+      let tradeSize: number;
+      
+      if (PAPER_TRADING.ENABLED) {
+        // Paper trading: use paper portfolio balance
+        const portfolio = getPaperPortfolio();
+        const maxSize = Math.min(POSITION_SIZING.MAX_PER_TRADE_SOL, portfolio.currentBalanceSOL * 0.9);
+        tradeSize = Math.min(POSITION_SIZING.IDEAL_PER_TRADE_SOL, maxSize);
+        
+        if (tradeSize < POSITION_SIZING.MIN_PER_TRADE_SOL) {
+          return this.reject(mint, symbol, `Insufficient paper balance for min trade size`);
+        }
+        logger.info(`📝 [PAPER] Trade size: ${tradeSize.toFixed(3)} SOL`);
+      } else {
+        // Real trading: use position manager
+        const sizeResult = await calculateTradeSize();
+        
+        if (!sizeResult.allowed) {
+          return this.reject(mint, symbol, sizeResult.reason || 'Trade size not allowed');
+        }
+        tradeSize = sizeResult.size;
+        logger.info(`Trade size: ${tradeSize.toFixed(3)} SOL`);
       }
-      logger.info(`Trade size: ${sizeResult.size.toFixed(3)} SOL`);
       
       // STAGE 5: Execute entry
       logger.info('[4/4] Executing entry...');
-      const entryResult = await this.executeEntry(mint, symbol, checklistResult, sizeResult.size);
+      const entryResult = await this.executeEntry(mint, symbol, checklistResult, tradeSize);
       
       if (!entryResult.entered) {
         return this.reject(mint, symbol, entryResult.reason, checklistResult);
@@ -195,6 +230,24 @@ export class TradePipeline {
       return { allowed: false, reason: `Trade cooldown: ${remaining}s remaining` };
     }
     
+    // Paper trading mode has different checks
+    if (PAPER_TRADING.ENABLED) {
+      const portfolio = getPaperPortfolio();
+      
+      // Check paper position limits
+      if (portfolio.positions.size >= PIPELINE_CONFIG.maxOpenPositions) {
+        return { allowed: false, reason: `Max paper positions reached (${portfolio.positions.size}/${PIPELINE_CONFIG.maxOpenPositions})` };
+      }
+      
+      // Check paper balance
+      if (portfolio.currentBalanceSOL < POSITION_SIZING.MIN_PER_TRADE_SOL) {
+        return { allowed: false, reason: `Insufficient paper balance: ${portfolio.currentBalanceSOL.toFixed(4)} SOL` };
+      }
+      
+      return { allowed: true };
+    }
+    
+    // Real trading checks
     // Check position limits
     const activePositions = getActivePositions();
     if (activePositions.length >= PIPELINE_CONFIG.maxOpenPositions) {
@@ -219,6 +272,11 @@ export class TradePipeline {
     checklistResult: ChecklistResult,
     totalSize: number
   ): Promise<{ entered: boolean; position?: Position; reason: string }> {
+    // Check if paper trading mode
+    if (PAPER_TRADING.ENABLED) {
+      return this.executePaperEntry(mint, symbol, checklistResult, totalSize);
+    }
+    
     try {
       // Get fresh token info
       const tokenInfo = await fetchTokenInfo(mint);
@@ -304,6 +362,76 @@ export class TradePipeline {
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : 'Unknown error';
       return { entered: false, reason: `Entry error: ${errMsg}` };
+    }
+  }
+  
+  /**
+   * Execute paper trading entry (simulation)
+   */
+  private async executePaperEntry(
+    mint: string,
+    symbol: string,
+    checklistResult: ChecklistResult,
+    totalSize: number
+  ): Promise<{ entered: boolean; position?: Position; reason: string }> {
+    try {
+      logger.info('📝 [PAPER MODE] Executing simulated entry...');
+      
+      // Generate entry signal for display (if entry analysis is available)
+      if (checklistResult.details.entryAnalysis) {
+        const signal = generateEntrySignal(
+          mint,
+          symbol,
+          checklistResult.details.entryAnalysis,
+          totalSize
+        );
+        displayEntrySignal(signal, symbol);
+      } else {
+        logger.info(`📝 [PAPER] Entry: ${totalSize.toFixed(3)} SOL → ${symbol}`);
+      }
+      
+      // Execute paper buy (full size, no tranches in paper mode for simplicity)
+      const paperTrade = await paperBuy(
+        mint,
+        symbol,
+        totalSize,
+        checklistResult.passedChecks
+      );
+      
+      // Create a Position object from the paper trade for the monitor
+      const position: Position = {
+        id: paperTrade.id,
+        mint,
+        symbol,
+        entryPrice: paperTrade.pricePerToken,
+        currentPrice: paperTrade.pricePerToken,
+        quantity: paperTrade.tokenAmount,
+        costBasis: paperTrade.solAmount,
+        unrealizedPnl: 0,
+        unrealizedPnlPercent: 0,
+        highestPrice: paperTrade.pricePerToken,
+        entryTime: new Date(paperTrade.timestamp),
+        tranches: [{
+          size: paperTrade.solAmount,
+          price: paperTrade.pricePerToken,
+          timestamp: new Date(paperTrade.timestamp),
+        }],
+        tpLevelsHit: [],
+        status: 'active',
+      };
+      
+      logger.success(`📝 [PAPER] Position opened: ${symbol}`);
+      
+      return {
+        entered: true,
+        position,
+        reason: 'Paper entry successful',
+      };
+      
+    } catch (error) {
+      const errMsg = error instanceof Error ? error.message : 'Unknown error';
+      logger.error(`📝 [PAPER] Entry failed: ${errMsg}`);
+      return { entered: false, reason: `Paper entry error: ${errMsg}` };
     }
   }
   

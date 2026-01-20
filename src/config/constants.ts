@@ -128,9 +128,13 @@ export const FEES_EXECUTION = {
 } as const;
 
 export const SLIPPAGE = {
-  // Normal operations
+  // Normal operations (live trading - accounts for volatility)
   BUY_SLIPPAGE_PERCENT: 10,
   SELL_SLIPPAGE_PERCENT: 12,
+  
+  // Paper trading - more realistic simulation (price impact only, no panic selling)
+  PAPER_BUY_SLIPPAGE_PERCENT: 1,
+  PAPER_SELL_SLIPPAGE_PERCENT: 1,
   
   // Emergency sell
   EMERGENCY_SELL_SLIPPAGE_PERCENT: 18,

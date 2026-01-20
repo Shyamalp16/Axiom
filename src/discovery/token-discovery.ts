@@ -60,8 +60,8 @@ export const DISCOVERY_CONFIG = {
   minTradeCount: 1,              // Some engagement
   
   // Polling
-  pollIntervalMs: 5000,          // Check every 5 seconds
-  pollLimit: 50,                 // Fetch up to 50 tokens per poll
+  pollIntervalMs: 15000,         // Check every 15 seconds (NEWEST API takes ~10s)
+  pollLimit: 500,                 // Fetch up to 50 tokens per poll
   
   // Watch & Revisit
   watchDelayMs: 180000,          // 3 minutes before re-checking new tokens
@@ -85,6 +85,7 @@ export class TokenDiscovery {
   private pollCount: number = 0;
   private lastPollTime: number = 0;
   private candidatesFound: number = 0;
+  private isPolling: boolean = false; // Lock to prevent concurrent polls
   
   // Multi-strategy state
   private currentStrategy: DiscoveryStrategy = 'live';
@@ -108,6 +109,16 @@ export class TokenDiscovery {
       return;
     }
     
+    // Clear any lingering intervals (safety)
+    if (this.pollInterval) {
+      clearInterval(this.pollInterval);
+      this.pollInterval = null;
+    }
+    if (this.watchInterval) {
+      clearInterval(this.watchInterval);
+      this.watchInterval = null;
+    }
+    
     this.isRunning = true;
     logger.info('Starting token discovery engine...');
     
@@ -116,25 +127,28 @@ export class TokenDiscovery {
       await connectPumpPortal();
     }
     
-    // 1. Start polling for candidates (rotates strategies)
+    // 1. Subscribe to new token events (adds to watchlist)
+    if (!this.unsubscribeNewTokens) {
+      this.unsubscribeNewTokens = subscribeNewTokens((newToken) => {
+        this.handleNewToken(newToken);
+      });
+    }
+    
+    // 2. Run initial poll immediately (continues from last strategy)
+    logger.info(`  Next strategy: ${this.strategyRotation[this.strategyIndex]} (index ${this.strategyIndex})`);
+    await this.pollCandidates();
+    
+    // 3. Start polling for candidates (rotates strategies)
     this.pollInterval = setInterval(
       () => this.pollCandidates(),
       DISCOVERY_CONFIG.pollIntervalMs
     );
     
-    // 2. Start watchlist checker
+    // 4. Start watchlist checker
     this.watchInterval = setInterval(
       () => this.checkWatchlist(),
       DISCOVERY_CONFIG.watchCheckIntervalMs
     );
-    
-    // 3. Subscribe to new token events (adds to watchlist)
-    this.unsubscribeNewTokens = subscribeNewTokens((newToken) => {
-      this.handleNewToken(newToken);
-    });
-    
-    // 4. Run initial poll immediately
-    await this.pollCandidates();
     
     logger.success('Token discovery engine started');
     logger.info(`  Strategies: ${this.strategyRotation.join(' → ')}`);
@@ -178,18 +192,29 @@ export class TokenDiscovery {
   private async pollCandidates(): Promise<void> {
     if (!this.isRunning) return;
     
+    // Prevent concurrent polls
+    if (this.isPolling) {
+      logger.warn('Poll already in progress, skipping');
+      return;
+    }
+    this.isPolling = true;
+    
     this.pollCount++;
     this.lastPollTime = Date.now();
     
-    // Rotate strategy
-    this.currentStrategy = this.strategyRotation[this.strategyIndex];
-    this.strategyIndex = (this.strategyIndex + 1) % this.strategyRotation.length;
+    // Rotate strategy - capture in local variable to avoid race conditions
+    const strategyIndex = this.strategyIndex;
+    const strategy = this.strategyRotation[strategyIndex];
+    this.currentStrategy = strategy; // For status display only
+    this.strategyIndex = (strategyIndex + 1) % this.strategyRotation.length;
     
     try {
       // Fetch tokens based on current strategy
       let tokens: PumpPortalToken[] = [];
       
-      switch (this.currentStrategy) {
+      logger.debug(`Poll #${this.pollCount}: strategy=${strategy} (index ${strategyIndex}→${this.strategyIndex})`);
+      
+      switch (strategy) {
         case 'live':
           tokens = await fetchCurrentlyLiveCoins(DISCOVERY_CONFIG.pollLimit);
           break;
@@ -197,13 +222,17 @@ export class TokenDiscovery {
           tokens = await fetchVolatileCoins();
           break;
         case 'newest':
+          logger.info('🆕 Fetching NEWEST tokens via searchCoins...');
           tokens = await searchCoins({
             complete: false,
             sort: 'created_timestamp',
             order: 'DESC',
             limit: DISCOVERY_CONFIG.pollLimit,
           });
+          logger.info(`🆕 NEWEST returned ${tokens.length} tokens`);
           break;
+        default:
+          logger.error(`Unknown strategy: ${strategy}`);
       }
       
       let added = 0;
@@ -211,6 +240,8 @@ export class TokenDiscovery {
       const rejectionReasons: Record<string, number> = {};
       
       // Process tokens
+      const notQueuedReasons: Record<string, number> = {};
+      
       for (const token of tokens) {
         const filterResult = this.getFilterReason(token);
         if (filterResult.passed) {
@@ -219,7 +250,12 @@ export class TokenDiscovery {
           if (wasAdded) {
             added++;
             this.candidatesFound++;
-            logger.info(`✓ ${token.symbol} $${token.marketCapUsd.toFixed(0)} [${this.currentStrategy}]`);
+            logger.info(`✓ ${token.symbol} $${token.marketCapUsd.toFixed(0)} [${strategy}]`);
+          } else {
+            // Token passed filter but wasn't queued - track why
+            const inCooldown = this.queue.isInCooldown(token.mint);
+            const reason = inCooldown ? 'cooldown' : 'duplicate';
+            notQueuedReasons[reason] = (notQueuedReasons[reason] || 0) + 1;
           }
         } else {
           // Track rejection reasons
@@ -232,10 +268,19 @@ export class TokenDiscovery {
       const rejectSummary = Object.entries(rejectionReasons)
         .map(([r, c]) => `${r}:${c}`)
         .join(' ');
-      logger.info(`[${this.currentStrategy.toUpperCase()}] ${tokens.length} tokens → ${passed} passed → +${added} queued | rejects: ${rejectSummary || 'none'}`);
+      
+      // Add not-queued reasons if any passed tokens weren't queued
+      const notQueuedSummary = Object.entries(notQueuedReasons)
+        .map(([r, c]) => `${r}:${c}`)
+        .join(' ');
+      
+      const suffix = notQueuedSummary ? ` | not queued: ${notQueuedSummary}` : '';
+      logger.info(`[${strategy.toUpperCase()}] ${tokens.length} tokens → ${passed} passed → +${added} queued | rejects: ${rejectSummary || 'none'}${suffix}`);
       
     } catch (error) {
-      logger.debug(`Discovery poll failed (${this.currentStrategy}): ${error}`);
+      logger.debug(`Discovery poll failed (${strategy}): ${error}`);
+    } finally {
+      this.isPolling = false;
     }
   }
   
