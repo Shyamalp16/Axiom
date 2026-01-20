@@ -9,10 +9,9 @@
  */
 
 import { POSITION_SIZING, DAILY_LIMITS, WEEKLY_LIMITS } from '../config/index.js';
-import { Position, Tranche, PositionStatus, Order, OrderReason } from '../types/index.js';
+import { Position, OrderReason } from '../types/index.js';
 import { getWalletBalance } from '../utils/solana.js';
 import logger from '../utils/logger.js';
-import { randomUUID as uuidv4 } from 'crypto';
 
 // In-memory position store (would use DB in production)
 let activePositions: Position[] = [];
@@ -251,13 +250,6 @@ export function getActivePositions(): Position[] {
 }
 
 /**
- * Get position by ID
- */
-export function getPosition(positionId: string): Position | undefined {
-  return activePositions.find(p => p.id === positionId);
-}
-
-/**
  * Get position by mint address
  */
 export function getPositionByMint(mint: string): Position | undefined {
@@ -276,13 +268,6 @@ export function getDailyStats() {
  */
 export function getWeeklyPnl(): number {
   return weeklyPnl;
-}
-
-/**
- * Reset weekly PnL (call on new week)
- */
-export function resetWeeklyPnl(): void {
-  weeklyPnl = 0;
 }
 
 /**
@@ -321,32 +306,4 @@ function getTimeInTrade(position: Position): string {
  */
 function generateId(): string {
   return `pos_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-}
-
-/**
- * Export state for persistence
- */
-export function exportState(): {
-  positions: Position[];
-  dailyStats: typeof dailyStats;
-  weeklyPnl: number;
-} {
-  return {
-    positions: activePositions,
-    dailyStats,
-    weeklyPnl,
-  };
-}
-
-/**
- * Import state from persistence
- */
-export function importState(state: {
-  positions: Position[];
-  dailyStats: typeof dailyStats;
-  weeklyPnl: number;
-}): void {
-  activePositions = state.positions;
-  dailyStats = state.dailyStats;
-  weeklyPnl = state.weeklyPnl;
 }

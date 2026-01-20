@@ -10,9 +10,8 @@
  * Data source: PumpPortal (https://pumpportal.fun)
  */
 
-import { PublicKey, Transaction, LAMPORTS_PER_SOL } from '@solana/web3.js';
-import { getWallet, sendAndConfirmTransaction } from '../utils/solana.js';
-import { SLIPPAGE, FEES_EXECUTION } from '../config/index.js';
+import { LAMPORTS_PER_SOL } from '@solana/web3.js';
+import { SLIPPAGE } from '../config/index.js';
 import logger from '../utils/logger.js';
 import {
   connectPumpPortal,
@@ -29,13 +28,23 @@ import {
   PumpPortalNewToken,
 } from './pump-portal.js';
 
-// Pump.fun program constants
-const PUMP_FUN_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
+// Bonding curve graduation threshold
 const BONDING_CURVE_SOL_TARGET = 85; // SOL needed to graduate
 
 // ============================================
 // TYPES (backwards compatible)
 // ============================================
+
+export interface PumpFunTrade {
+  signature: string;
+  mint: string;
+  solAmount: number;
+  tokenAmount: number;
+  isBuy: boolean;
+  user: string;
+  timestamp: number;
+  slot: number;
+}
 
 export interface PumpFunToken {
   mint: string;
@@ -74,17 +83,6 @@ export interface PumpFunToken {
   // Stats
   replyCount: number;
   lastReply?: number;
-}
-
-export interface PumpFunTrade {
-  signature: string;
-  mint: string;
-  solAmount: number;
-  tokenAmount: number;
-  isBuy: boolean;
-  user: string;
-  timestamp: number;
-  slot: number;
 }
 
 // ============================================

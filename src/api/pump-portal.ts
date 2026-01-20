@@ -188,17 +188,6 @@ export function connectPumpPortal(): Promise<void> {
 }
 
 /**
- * Disconnect from PumpPortal
- */
-export function disconnectPumpPortal(): void {
-  if (ws) {
-    ws.close();
-    ws = null;
-    isConnected = false;
-  }
-}
-
-/**
  * Attempt to reconnect
  */
 function attemptReconnect(): void {
@@ -490,25 +479,10 @@ export function getCachedTrades(mint: string): PumpPortalTrade[] {
 }
 
 /**
- * Check if we have data for a token
- */
-export function hasTokenData(mint: string): boolean {
-  return tokenCache.has(mint);
-}
-
-/**
  * Get connection status
  */
 export function isConnectedToPumpPortal(): boolean {
   return isConnected;
-}
-
-/**
- * Clear caches
- */
-export function clearCaches(): void {
-  tokenCache.clear();
-  tradeCache.clear();
 }
 
 // ============================================

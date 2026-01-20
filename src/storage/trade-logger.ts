@@ -11,7 +11,7 @@
  * After 20-30 trades, patterns will scream at you.
  */
 
-import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { format } from 'date-fns';
 import { TradeLog, DailyStats, Position, OrderReason } from '../types/index.js';
@@ -19,7 +19,6 @@ import logger from '../utils/logger.js';
 
 const DATA_DIR = './data';
 const TRADES_FILE = join(DATA_DIR, 'trades.json');
-const STATS_FILE = join(DATA_DIR, 'stats.json');
 
 // Ensure data directory exists
 if (!existsSync(DATA_DIR)) {
@@ -110,29 +109,6 @@ export function getAllTrades(): TradeLog[] {
 }
 
 /**
- * Get trades for a specific date range
- */
-export function getTradesByDateRange(startDate: Date, endDate: Date): TradeLog[] {
-  const trades = loadTrades();
-  return trades.filter(t => {
-    const tradeDate = new Date(t.timestamp);
-    return tradeDate >= startDate && tradeDate <= endDate;
-  });
-}
-
-/**
- * Get today's trades
- */
-export function getTodaysTrades(): TradeLog[] {
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const tomorrow = new Date(today);
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  
-  return getTradesByDateRange(today, tomorrow);
-}
-
-/**
  * Calculate daily statistics
  */
 export function calculateDailyStats(date: Date = new Date()): DailyStats {
@@ -141,7 +117,11 @@ export function calculateDailyStats(date: Date = new Date()): DailyStats {
   const dayEnd = new Date(dayStart);
   dayEnd.setDate(dayEnd.getDate() + 1);
   
-  const trades = getTradesByDateRange(dayStart, dayEnd);
+  const allTrades = loadTrades();
+  const trades = allTrades.filter(t => {
+    const tradeDate = new Date(t.timestamp);
+    return tradeDate >= dayStart && tradeDate <= dayEnd;
+  });
   
   const wins = trades.filter(t => t.pnl > 0);
   const losses = trades.filter(t => t.pnl <= 0);
@@ -289,45 +269,3 @@ export function displayTradeSummary(): void {
   }
 }
 
-/**
- * Export trades to CSV
- */
-export function exportToCSV(): string {
-  const trades = loadTrades();
-  
-  const headers = [
-    'Date',
-    'Symbol',
-    'Entry Price',
-    'Exit Price',
-    'Size (SOL)',
-    'PnL (SOL)',
-    'PnL %',
-    'Time (s)',
-    'Exit Reason',
-    'Slippage Expected',
-    'Slippage Actual',
-  ];
-  
-  const rows = trades.map(t => [
-    format(new Date(t.timestamp), 'yyyy-MM-dd HH:mm:ss'),
-    t.symbol,
-    t.entryPrice.toFixed(8),
-    t.exitPrice.toFixed(8),
-    t.size.toFixed(4),
-    t.pnl.toFixed(4),
-    t.pnlPercent.toFixed(2),
-    t.timeInTrade.toFixed(0),
-    t.exitReason,
-    t.slippageExpected.toFixed(2),
-    t.slippageActual.toFixed(2),
-  ]);
-  
-  const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
-  
-  const csvPath = join(DATA_DIR, `trades_${format(new Date(), 'yyyyMMdd')}.csv`);
-  writeFileSync(csvPath, csv);
-  
-  logger.success(`Trades exported to ${csvPath}`);
-  return csvPath;
-}

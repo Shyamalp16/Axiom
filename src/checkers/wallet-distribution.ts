@@ -249,36 +249,3 @@ function calculateDistributionScore(holders: HolderInfo[]): number {
   return Math.round(Math.min(100, score));
 }
 
-/**
- * Monitor wallet for accumulation during entry
- * Returns true if should cancel buy
- */
-export async function monitorAccumulationDuringEntry(
-  mintAddress: string,
-  durationSeconds: number = 30
-): Promise<{ shouldCancel: boolean; reason?: string }> {
-  // This would monitor in real-time during the entry window
-  // If any wallet accumulates > ACCUMULATION_ALERT_PERCENT, cancel
-  
-  // TODO: Implement real-time monitoring via websocket
-  // For now, return safe
-  return { shouldCancel: false };
-}
-
-/**
- * Get simplified holder breakdown for display
- */
-export function formatHolderBreakdown(holders: HolderInfo[]): string[] {
-  const lines: string[] = [];
-  
-  const nonLP = holders.filter(h => !h.isLP).slice(0, 10);
-  
-  for (let i = 0; i < nonLP.length; i++) {
-    const h = nonLP[i];
-    const label = h.isDev ? ' (DEV)' : '';
-    const shortAddr = `${h.address.slice(0, 4)}...${h.address.slice(-4)}`;
-    lines.push(`#${i + 1}: ${shortAddr}${label} - ${h.percent.toFixed(1)}%`);
-  }
-  
-  return lines;
-}

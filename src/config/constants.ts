@@ -245,18 +245,14 @@ export const PAPER_TRADING = {
 // TECHNICAL DEFAULTS
 // ============================================
 
-export const CANDLE_TIMEFRAME_SECONDS = 15; // 15-second candles for memecoins
-export const WEBSOCKET_RECONNECT_DELAY_MS = 1000;
 export const API_RETRY_ATTEMPTS = 3;
 export const API_RETRY_DELAY_MS = 500;
 
 // Jupiter API
 export const JUPITER_API_URL = 'https://quote-api.jup.ag/v6';
-export const JUPITER_SWAP_API_URL = 'https://quote-api.jup.ag/v6/swap';
 
 // SOL mint address
 export const SOL_MINT = 'So11111111111111111111111111111111111111112';
-export const WSOL_DECIMALS = 9;
 
 // ============================================
 // PUMP.FUN SPECIFIC SETTINGS

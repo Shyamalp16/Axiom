@@ -15,9 +15,7 @@
  */
 
 import { 
-  Connection, 
   VersionedTransaction, 
-  TransactionMessage,
   PublicKey,
 } from '@solana/web3.js';
 import { 
@@ -33,7 +31,7 @@ import {
   solToLamports,
   withRetry 
 } from '../utils/solana.js';
-import { Order, OrderStatus, JupiterQuote } from '../types/index.js';
+import { JupiterQuote } from '../types/index.js';
 import { 
   fetchPumpFunToken, 
   buyOnPumpFun, 
@@ -327,32 +325,3 @@ export async function getTokenBalance(tokenMint: string): Promise<number> {
   }
 }
 
-/**
- * Estimate transaction fees
- */
-export function estimateFees(): {
-  priorityFee: number;
-  jitoBribe: number;
-  total: number;
-} {
-  const priorityFee = FEES_EXECUTION.PRIORITY_FEE_SOL;
-  const jitoBribe = FEES_EXECUTION.JITO_BRIBE_SOL;
-  
-  return {
-    priorityFee,
-    jitoBribe,
-    total: priorityFee + jitoBribe + 0.000005, // Base fee
-  };
-}
-
-/**
- * Check if we can afford the transaction
- */
-export async function canAffordTransaction(tradeSizeSol: number): Promise<boolean> {
-  const fees = estimateFees();
-  const totalRequired = tradeSizeSol + (fees.total * 2); // Round trip
-  
-  const balance = await (await import('../utils/solana.js')).getWalletBalance();
-  
-  return balance >= totalRequired;
-}

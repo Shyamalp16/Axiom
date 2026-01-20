@@ -16,8 +16,7 @@ import { Position, OrderReason } from '../types/index.js';
 import { 
   updatePosition, 
   closePosition, 
-  getActivePositions,
-  getPosition 
+  getActivePositions
 } from './position-manager.js';
 import { fetchCandles } from '../api/data-providers.js';
 import logger from '../utils/logger.js';
@@ -240,35 +239,3 @@ export function startTPSLMonitoring(intervalMs: number = 5000): () => void {
   };
 }
 
-/**
- * Calculate TP/SL levels for display
- */
-export function calculateTPSLLevels(entryPrice: number): {
-  stopLoss: number;
-  tp1: number;
-  tp2: number;
-  trailingStopFromHigh: number;
-} {
-  return {
-    stopLoss: entryPrice * (1 + STOP_LOSS.HARD_STOP_PERCENT / 100),
-    tp1: entryPrice * (1 + TAKE_PROFIT.TP1_PERCENT / 100),
-    tp2: entryPrice * (1 + TAKE_PROFIT.TP2_PERCENT / 100),
-    trailingStopFromHigh: Math.abs(TAKE_PROFIT.RUNNER_TRAILING_STOP_PERCENT),
-  };
-}
-
-/**
- * Format TP/SL status for display
- */
-export function formatTPSLStatus(position: Position): string[] {
-  const levels = calculateTPSLLevels(position.entryPrice);
-  const tp1Hit = position.tpLevelsHit.includes(1) ? '✓' : '○';
-  const tp2Hit = position.tpLevelsHit.includes(2) ? '✓' : '○';
-  
-  return [
-    `Stop Loss: $${levels.stopLoss.toFixed(6)} (${STOP_LOSS.HARD_STOP_PERCENT}%)`,
-    `TP1 ${tp1Hit}: $${levels.tp1.toFixed(6)} (+${TAKE_PROFIT.TP1_PERCENT}%) → Sell ${TAKE_PROFIT.TP1_SELL_PERCENT}%`,
-    `TP2 ${tp2Hit}: $${levels.tp2.toFixed(6)} (+${TAKE_PROFIT.TP2_PERCENT}%) → Sell ${TAKE_PROFIT.TP2_SELL_PERCENT}%`,
-    `Runner: ${TAKE_PROFIT.RUNNER_PERCENT}% with -${levels.trailingStopFromHigh}% trailing`,
-  ];
-}

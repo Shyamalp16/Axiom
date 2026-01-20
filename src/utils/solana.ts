@@ -5,10 +5,9 @@ import {
   Transaction,
   VersionedTransaction,
   SendOptions,
-  Commitment,
 } from '@solana/web3.js';
 import bs58 from 'bs58';
-import { ENV, FEES_EXECUTION } from '../config/index.js';
+import { ENV } from '../config/index.js';
 import logger from './logger.js';
 
 let connection: Connection | null = null;
@@ -59,18 +58,6 @@ export async function getWalletBalance(): Promise<number> {
 }
 
 /**
- * Check if address is valid Solana public key
- */
-export function isValidPublicKey(address: string): boolean {
-  try {
-    new PublicKey(address);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
  * Send and confirm transaction with retry logic
  */
 export async function sendAndConfirmTransaction(
@@ -112,33 +99,10 @@ export async function sendAndConfirmTransaction(
 }
 
 /**
- * Get current priority fee estimate
- */
-export async function getPriorityFee(): Promise<number> {
-  // For now, return the configured priority fee
-  // In production, you'd query recent priority fees and adjust
-  return FEES_EXECUTION.PRIORITY_FEE_SOL;
-}
-
-/**
- * Format lamports to SOL with precision
- */
-export function lamportsToSol(lamports: number): number {
-  return lamports / 1e9;
-}
-
-/**
  * Format SOL to lamports
  */
 export function solToLamports(sol: number): number {
   return Math.floor(sol * 1e9);
-}
-
-/**
- * Shorten address for display
- */
-export function shortenAddress(address: string, chars = 4): string {
-  return `${address.slice(0, chars)}...${address.slice(-chars)}`;
 }
 
 /**

@@ -298,22 +298,6 @@ export interface RoutePlan {
   percent: number;
 }
 
-export interface HeliusTokenMetadata {
-  mint: string;
-  onChainMetadata?: {
-    metadata?: {
-      name: string;
-      symbol: string;
-    };
-  };
-  offChainMetadata?: {
-    metadata?: {
-      name: string;
-      symbol: string;
-    };
-  };
-}
-
 export interface BirdeyeTokenOverview {
   address: string;
   symbol: string;

@@ -1,7 +1,7 @@
 import chalk from 'chalk';
 import { format } from 'date-fns';
 
-export enum LogLevel {
+enum LogLevel {
   DEBUG = 0,
   INFO = 1,
   WARN = 2,

@@ -26,21 +26,6 @@ let lastBirdeyeRequest = 0;
 const BIRDEYE_MIN_DELAY_MS = 500; // Minimum 500ms between requests (Birdeye free tier limit)
 
 /**
- * Throttled fetch for Birdeye API to avoid rate limits
- */
-async function throttledBirdeyeFetch(url: string, options: RequestInit): Promise<Response> {
-  const now = Date.now();
-  const timeSinceLastRequest = now - lastBirdeyeRequest;
-  
-  if (timeSinceLastRequest < BIRDEYE_MIN_DELAY_MS) {
-    await sleep(BIRDEYE_MIN_DELAY_MS - timeSinceLastRequest);
-  }
-  
-  lastBirdeyeRequest = Date.now();
-  return fetch(url, options);
-}
-
-/**
  * Fetch token metadata and basic info
  * For pump.fun tokens, uses pump.fun API first (more reliable)
  */
@@ -269,38 +254,6 @@ export async function fetchTokenHolders(
   
   // Return empty if no data available
   return [];
-}
-
-/**
- * Detect DEX platform from source string
- */
-function detectDexPlatform(source: string): 'raydium' | 'bags' | 'meteora' | 'meteora_v2' | 'pump_amm' | 'unknown' {
-  const s = source.toLowerCase();
-  
-  // Raydium variants
-  if (s.includes('raydium')) {
-    return 'raydium';
-  }
-  
-  // Meteora variants (DLMM = V2, otherwise V1)
-  if (s.includes('meteora') || s.includes('mercurial')) {
-    if (s.includes('dlmm') || s.includes('v2') || s.includes('dynamic')) {
-      return 'meteora_v2';
-    }
-    return 'meteora';
-  }
-  
-  // Pump AMM / PumpSwap variants
-  if (s.includes('pump') || s.includes('pumpswap') || s.includes('pumpfun')) {
-    return 'pump_amm';
-  }
-  
-  // BAGS (if it's actually a DEX)
-  if (s.includes('bags')) {
-    return 'bags';
-  }
-  
-  return 'unknown';
 }
 
 /**

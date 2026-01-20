@@ -10,11 +10,7 @@
  */
 
 import { DEV_MONITORING } from '../config/index.js';
-import { 
-  DevWalletActivity, 
-  AlertType, 
-  Position 
-} from '../types/index.js';
+import { AlertType } from '../types/index.js';
 import { getActivePositions, closePosition } from '../trading/position-manager.js';
 import { emergencySell, getTokenBalance } from '../trading/executor.js';
 import { fetchTokenHolders, fetchLPInfo } from '../api/data-providers.js';
@@ -331,16 +327,3 @@ export function startMonitoringLoop(intervalMs: number = 10000): () => void {
   };
 }
 
-/**
- * Get recent alerts
- */
-export function getRecentAlerts(count: number = 10): AlertType[] {
-  return alertHistory.slice(-count);
-}
-
-/**
- * Get monitored tokens list
- */
-export function getMonitoredTokens(): string[] {
-  return Array.from(monitoredTokens.keys());
-}
