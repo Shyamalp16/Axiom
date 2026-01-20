@@ -255,6 +255,51 @@ export const JUPITER_API_URL = 'https://quote-api.jup.ag/v6';
 export const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
 // ============================================
+// AUTO-TRADE SETTINGS
+// ============================================
+
+export const AUTO_TRADE = {
+  // Discovery settings
+  DISCOVERY_POLL_INTERVAL_MS: 5000,    // Poll every 5 seconds
+  CANDIDATE_QUEUE_MAX_SIZE: 50,        // Max candidates in queue
+  CANDIDATE_COOLDOWN_MINUTES: 15,      // Cooldown for rejected tokens
+  
+  // Pipeline settings
+  MAX_CONCURRENT_ANALYSIS: 2,          // Don't overload APIs
+  TRADE_COOLDOWN_MS: 60000,            // 1 minute between trades
+  AUTO_ENTER_ON_PASS: true,            // Enter automatically when checklist passes
+  ENABLE_TRANCHE_2: true,              // Enable second tranche execution
+  
+  // Discovery filters (also in PUMP_FUN section)
+  MIN_AGE_MINUTES: 2,
+  MAX_AGE_MINUTES: 30,
+  MIN_BONDING_CURVE_PROGRESS: 15,
+  MAX_BONDING_CURVE_PROGRESS: 85,
+  MIN_MARKET_CAP_USD: 8000,
+  MAX_MARKET_CAP_USD: 50000,
+  MIN_TRADE_COUNT: 5,
+} as const;
+
+// ============================================
+// METIS API SETTINGS (Public Endpoint)
+// ============================================
+
+export const METIS_API = {
+  // Public endpoint (has swap fees but works without API key)
+  PUBLIC_ENDPOINT: 'https://public.jupiterapi.com',
+  
+  // Priority fee levels: 'low' | 'medium' | 'high' | 'veryHigh'
+  DEFAULT_PRIORITY_FEE: 'high' as const,
+  
+  // Retry settings
+  MAX_RETRIES: 3,
+  RETRY_DELAY_MS: 500,
+  
+  // Request timeout
+  REQUEST_TIMEOUT_MS: 30000,
+} as const;
+
+// ============================================
 // PUMP.FUN SPECIFIC SETTINGS
 // ============================================
 

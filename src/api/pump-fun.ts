@@ -27,6 +27,7 @@ import {
   PumpPortalTrade,
   PumpPortalNewToken,
 } from './pump-portal.js';
+import { metisBuy, metisSell } from './metis-swap.js';
 
 // Bonding curve graduation threshold
 const BONDING_CURVE_SOL_TARGET = 85; // SOL needed to graduate
@@ -344,6 +345,7 @@ export function calculatePumpFunSellQuote(
 
 /**
  * Buy tokens on Pump.fun bonding curve
+ * Uses Metis public API for real trade execution
  */
 export async function buyOnPumpFun(
   mintAddress: string,
@@ -353,11 +355,13 @@ export async function buyOnPumpFun(
   success: boolean;
   signature?: string;
   tokenAmount?: number;
+  amountReceived?: number;
   error?: string;
 }> {
   logger.info(`Pump.fun BUY: ${solAmount} SOL → ${mintAddress.slice(0, 8)}...`);
   
   try {
+    // 1. Validate token via PumpPortal
     const token = await fetchPumpFunToken(mintAddress);
     
     if (!token) {
@@ -368,7 +372,7 @@ export async function buyOnPumpFun(
       return { success: false, error: 'Token graduated to Raydium - use Jupiter' };
     }
     
-    // Calculate expected output
+    // 2. Calculate expected output for logging/estimation
     const quote = calculatePumpFunBuyQuote(token, solAmount);
     
     if (quote.priceImpact > slippagePercent) {
@@ -378,13 +382,22 @@ export async function buyOnPumpFun(
       };
     }
     
-    // For paper trading, just return success with calculated amount
-    // Real trading would require transaction building
-    logger.success(`Pump.fun BUY simulated: ${quote.tokenAmount.toFixed(2)} tokens`);
+    logger.info(`Expected output: ~${quote.tokenAmount.toFixed(2)} tokens (${quote.priceImpact.toFixed(2)}% impact)`);
+    
+    // 3. Execute via Metis public API
+    const result = await metisBuy(mintAddress, solAmount, 'high');
+    
+    if (!result.success) {
+      return { success: false, error: result.error };
+    }
+    
+    logger.success(`Pump.fun BUY executed: ${result.signature}`);
     
     return {
       success: true,
+      signature: result.signature,
       tokenAmount: quote.tokenAmount,
+      amountReceived: quote.tokenAmount, // Estimated from bonding curve calc
     };
     
   } catch (error) {
@@ -396,6 +409,7 @@ export async function buyOnPumpFun(
 
 /**
  * Sell tokens on Pump.fun bonding curve
+ * Uses Metis public API for real trade execution
  */
 export async function sellOnPumpFun(
   mintAddress: string,
@@ -405,11 +419,13 @@ export async function sellOnPumpFun(
   success: boolean;
   signature?: string;
   solAmount?: number;
+  amountReceived?: number;
   error?: string;
 }> {
   logger.info(`Pump.fun SELL: ${tokenAmount} tokens → SOL`);
   
   try {
+    // 1. Validate token via PumpPortal
     const token = await fetchPumpFunToken(mintAddress);
     
     if (!token) {
@@ -420,19 +436,31 @@ export async function sellOnPumpFun(
       return { success: false, error: 'Token graduated to Raydium - use Jupiter' };
     }
     
-    // Calculate expected output
+    // 2. Calculate expected output for logging/estimation
     const quote = calculatePumpFunSellQuote(token, tokenAmount);
     
     if (quote.priceImpact > slippagePercent) {
       logger.warn(`High price impact: ${quote.priceImpact.toFixed(2)}%`);
     }
     
-    // For paper trading, return success with calculated amount
-    logger.success(`Pump.fun SELL simulated: ${quote.solAmount.toFixed(4)} SOL`);
+    logger.info(`Expected output: ~${quote.solAmount.toFixed(4)} SOL (${quote.priceImpact.toFixed(2)}% impact)`);
+    
+    // 3. Execute via Metis public API
+    // Note: Metis expects token amount in token atoms (typically * 1e6)
+    const tokenAtoms = Math.floor(tokenAmount * 1e6);
+    const result = await metisSell(mintAddress, tokenAtoms, 'high');
+    
+    if (!result.success) {
+      return { success: false, error: result.error };
+    }
+    
+    logger.success(`Pump.fun SELL executed: ${result.signature}`);
     
     return {
       success: true,
+      signature: result.signature,
       solAmount: quote.solAmount,
+      amountReceived: quote.solAmount, // Estimated from bonding curve calc
     };
     
   } catch (error) {

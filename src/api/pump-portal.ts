@@ -701,16 +701,9 @@ async function convertApiResponseToToken(data: PumpFunApiResponse): Promise<Pump
     marketCapSol = marketCapUsd / solPrice;
   }
   
-  // Logging for troubleshooting (visible level)
-  if (ageMinutes < 1 || marketCapUsd === 0 || priceSol === 0) {
-    logger.warn(
-      `API data check - ${data.symbol}: raw_timestamp=${data.created_timestamp}, ` +
-      `raw_virtual_sol=${rawVirtualSol}, raw_virtual_tokens=${rawVirtualTokens}, ` +
-      `virtual_sol=${virtualSolReserves}, virtual_tokens=${virtualTokenReserves}, ` +
-      `price_sol=${priceSol.toFixed(12)}, price_usd=${priceUsd.toFixed(8)}, ` +
-      `raw_mcap=${rawMarketCap}, raw_usd_mcap=${data.usd_market_cap || data.market_cap_usd || 0}, ` +
-      `calculated_mcap=$${marketCapUsd.toFixed(0)}`
-    );
+  // Debug logging only for problematic tokens (missing price/mcap)
+  if (marketCapUsd === 0 && priceSol === 0) {
+    logger.debug(`API: ${data.symbol} missing price/mcap data`);
   }
   
   return {
