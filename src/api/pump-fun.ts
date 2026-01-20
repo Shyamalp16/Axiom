@@ -445,16 +445,12 @@ export async function sellOnPumpFun(
 // ============================================
 
 /**
- * Get SOL price in USD
+ * Get SOL price in USD (uses pump.fun /sol-price API via pump-portal)
  */
 async function getSolPriceUsd(): Promise<number> {
-  try {
-    const response = await fetch('https://price.jup.ag/v4/price?ids=SOL');
-    const data = await response.json() as { data?: { SOL?: { price?: number } } };
-    return data.data?.SOL?.price || 150;
-  } catch {
-    return 150;
-  }
+  // Use the getSolPrice from pump-portal for consistency
+  const { getSolPrice } = await import('./pump-portal.js');
+  return getSolPrice();
 }
 
 /**

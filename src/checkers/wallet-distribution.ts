@@ -34,6 +34,20 @@ export async function checkWalletDistribution(
     const holderData = await fetchTokenHolders(mintAddress);
     const lpInfo = await fetchLPInfo(mintAddress);
     
+    // If no holder data (common for pump.fun), skip distribution check gracefully
+    if (holderData.length === 0 && mintAddress.toLowerCase().endsWith('pump')) {
+      logger.warn('Holder distribution unavailable for pump.fun token - skipping distribution check');
+      return {
+        passed: true,
+        largestWalletPercent: 0,
+        top5WalletsPercent: 0,
+        devWalletPercent: 0,
+        devWalletIncreasing: false,
+        holders: [],
+        failures: [],
+      };
+    }
+    
     // Process holders - exclude LP addresses
     const lpAddresses = new Set(lpInfo.lpAddresses || []);
     

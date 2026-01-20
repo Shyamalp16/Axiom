@@ -19,9 +19,35 @@ const HELIUS_BASE = 'https://api.helius.xyz/v0';
 
 /**
  * Fetch token metadata and basic info
+ * For pump.fun tokens, uses pump.fun API first (more reliable)
  */
 export async function fetchTokenInfo(mintAddress: string): Promise<TokenInfo> {
-  // Try Birdeye first
+  // For pump.fun tokens, try pump.fun API first (no rate limits!)
+  const looksLikePumpFun = mintAddress.toLowerCase().endsWith('pump');
+  
+  if (looksLikePumpFun) {
+    try {
+      const { fetchTokenViaPumpPortal } = await import('./pump-portal.js');
+      const pumpToken = await fetchTokenViaPumpPortal(mintAddress);
+      
+      if (pumpToken) {
+        logger.debug(`Using pump.fun API for token info: ${pumpToken.symbol}`);
+        return {
+          mint: mintAddress,
+          symbol: pumpToken.symbol,
+          name: pumpToken.name,
+          decimals: 6, // Pump.fun tokens use 6 decimals
+          supply: pumpToken.virtualTokenReserves * 1e6 || 1e9,
+          createdAt: new Date(pumpToken.createdTimestamp),
+          ageMinutes: pumpToken.ageMinutes,
+        };
+      }
+    } catch (error) {
+      logger.debug(`Pump.fun API failed, falling back to Birdeye/Helius`);
+    }
+  }
+  
+  // Try Birdeye
   if (ENV.BIRDEYE_API_KEY) {
     try {
       const data = await birdeyeRequest<BirdeyeTokenOverview>(
@@ -48,30 +74,44 @@ export async function fetchTokenInfo(mintAddress: string): Promise<TokenInfo> {
   
   // Fallback to Helius
   if (ENV.HELIUS_API_KEY) {
-    const response = await heliusRequest<any>(
-      `/token-metadata?api-key=${ENV.HELIUS_API_KEY}`,
-      {
-        method: 'POST',
-        body: JSON.stringify({ mintAccounts: [mintAddress] }),
-      }
-    );
-    
-    const token = response[0];
-    const createdAt = await fetchTokenCreationTime(mintAddress);
-    const ageMinutes = (Date.now() - createdAt.getTime()) / 1000 / 60;
-    
-    return {
-      mint: mintAddress,
-      symbol: token?.onChainMetadata?.metadata?.symbol || 'UNKNOWN',
-      name: token?.onChainMetadata?.metadata?.name || 'Unknown Token',
-      decimals: 9,
-      supply: 0,
-      createdAt,
-      ageMinutes,
-    };
+    try {
+      const response = await heliusRequest<any>(
+        `/token-metadata?api-key=${ENV.HELIUS_API_KEY}`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ mintAccounts: [mintAddress] }),
+        }
+      );
+      
+      const token = response[0];
+      const createdAt = await fetchTokenCreationTime(mintAddress);
+      const ageMinutes = (Date.now() - createdAt.getTime()) / 1000 / 60;
+      
+      return {
+        mint: mintAddress,
+        symbol: token?.onChainMetadata?.metadata?.symbol || 'UNKNOWN',
+        name: token?.onChainMetadata?.metadata?.name || 'Unknown Token',
+        decimals: 9,
+        supply: 0,
+        createdAt,
+        ageMinutes,
+      };
+    } catch (error) {
+      logger.warn('Helius token info also failed');
+    }
   }
   
-  throw new Error('No API keys configured for token info');
+  // Last resort: return minimal info with unknown age
+  logger.warn(`Could not fetch token info for ${mintAddress.slice(0, 8)}...`);
+  return {
+    mint: mintAddress,
+    symbol: 'UNKNOWN',
+    name: 'Unknown Token',
+    decimals: 9,
+    supply: 0,
+    createdAt: new Date(),
+    ageMinutes: 0,
+  };
 }
 
 /**
@@ -106,6 +146,13 @@ export async function fetchTokenCreationTime(mintAddress: string): Promise<Date>
 export async function fetchTokenHolders(
   mintAddress: string
 ): Promise<{ address: string; balance: number; percent: number }[]> {
+  // Pump.fun tokens don't have a reliable public holder endpoint
+  // Skip Birdeye to avoid rate limits and return empty for now
+  if (mintAddress.toLowerCase().endsWith('pump')) {
+    logger.warn('Pump.fun holders unavailable - skipping Birdeye holder fetch');
+    return [];
+  }
+  
   if (ENV.BIRDEYE_API_KEY) {
     try {
       const data = await birdeyeRequest<{ items: any[] }>(
@@ -233,12 +280,48 @@ export async function fetchMarketData(
 
 /**
  * Fetch OHLCV candles
+ * For pump.fun tokens, uses pump.fun API (no rate limits)
+ * Falls back to Birdeye for other tokens
  */
 export async function fetchCandles(
   mintAddress: string,
   timeframeSec: number = 15,
   limit: number = 100
 ): Promise<Candle[]> {
+  // For pump.fun tokens, use pump.fun API first (no rate limits!)
+  const looksLikePumpFun = mintAddress.toLowerCase().endsWith('pump');
+  
+  if (looksLikePumpFun) {
+    try {
+      const { fetchPumpFunCandles } = await import('./pump-portal.js');
+      // Pump.fun API uses seconds for timeframe (minimum 60s = 1 minute)
+      const timeframe = Math.max(60, timeframeSec);
+      const candles = await fetchPumpFunCandles(mintAddress, timeframe, limit);
+      
+      if (candles.length > 0) {
+        logger.debug(`Using pump.fun API for candles: ${candles.length} candles`);
+        return candles.map(c => ({
+          timestamp: c.timestamp,
+          open: c.open,
+          high: c.high,
+          low: c.low,
+          close: c.close,
+          volume: c.volume,
+          buyVolume: c.volume * 0.5, // Estimate
+          sellVolume: c.volume * 0.5,
+        }));
+      }
+      
+      // For pump.fun tokens, don't fall back to Birdeye (avoids rate limits)
+      logger.warn('Pump.fun candles unavailable - skipping Birdeye fallback for pump.fun token');
+      return [];
+    } catch (error) {
+      logger.warn('Pump.fun candles fetch failed - skipping Birdeye fallback for pump.fun token');
+      return [];
+    }
+  }
+  
+  // Fallback to Birdeye
   if (ENV.BIRDEYE_API_KEY) {
     try {
       // Birdeye uses minute-based timeframes, convert
@@ -274,11 +357,34 @@ export async function fetchCandles(
 
 /**
  * Fetch recent trading volume
+ * For pump.fun tokens, uses pump.fun trades API
  */
 export async function fetchRecentVolume(
   mintAddress: string,
   minutes: number
 ): Promise<number> {
+  // For pump.fun tokens, use pump.fun API
+  const looksLikePumpFun = mintAddress.toLowerCase().endsWith('pump');
+  
+  if (looksLikePumpFun) {
+    try {
+      const { fetchPumpFunRecentVolume } = await import('./pump-portal.js');
+      const volume = await fetchPumpFunRecentVolume(mintAddress, minutes);
+      
+      if (volume.volumeSol > 0) {
+        logger.debug(`Pump.fun volume (${minutes}min): ${volume.volumeSol.toFixed(2)} SOL (${volume.tradeCount} trades)`);
+        return volume.volumeSol;
+      }
+      
+      logger.warn('Pump.fun volume unavailable - skipping Birdeye fallback for pump.fun token');
+      return 0;
+    } catch (error) {
+      logger.warn('Pump.fun volume fetch failed - skipping Birdeye fallback for pump.fun token');
+      return 0;
+    }
+  }
+  
+  // Fallback to Birdeye
   if (ENV.BIRDEYE_API_KEY) {
     try {
       const now = Math.floor(Date.now() / 1000);

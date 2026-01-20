@@ -128,9 +128,17 @@ async function handleCheck() {
       if (pumpToken) {
         symbol = pumpToken.symbol;
         logger.info(`Token: ${pumpToken.name} (${symbol})`);
-        logger.info(`Platform: 🟢 Pump.fun`);
-        logger.info(`Bonding Curve: ${pumpToken.bondingCurveProgress.toFixed(1)}%`);
-        logger.info(`Market Cap: $${pumpToken.marketCapUsd.toFixed(0)}`);
+        
+        if (pumpToken.isGraduated) {
+          // Token has graduated to Raydium
+          logger.info(`Platform: 🔵 Graduated to Raydium`);
+          logger.info(`Market Cap: $${pumpToken.marketCapUsd > 0 ? pumpToken.marketCapUsd.toLocaleString() : 'N/A (check Raydium)'}`);
+        } else {
+          // Still on Pump.fun bonding curve
+          logger.info(`Platform: 🟢 Pump.fun`);
+          logger.info(`Bonding Curve: ${pumpToken.bondingCurveProgress.toFixed(1)}%`);
+          logger.info(`Market Cap: $${pumpToken.marketCapUsd > 0 ? pumpToken.marketCapUsd.toLocaleString() : pumpToken.marketCapSol.toFixed(2) + ' SOL'}`);
+        }
       } else {
         logger.info(`Token: ${mintAddress.slice(0, 8)}...`);
         logger.info(`Platform: 🟢 Pump.fun (data pending)`);

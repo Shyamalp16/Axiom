@@ -18,6 +18,27 @@ import logger from '../utils/logger.js';
 // PumpPortal WebSocket endpoint
 const PUMPPORTAL_WS_URL = 'wss://pumpportal.fun/api/data';
 
+// Pump.fun REST API endpoints
+const PUMPFUN_API_URL = 'https://frontend-api-v3.pump.fun';
+const PUMPFUN_ADVANCED_API_URL = 'https://advanced-api-v2.pump.fun';
+const PUMPFUN_VOLATILITY_API_URL = 'https://volatility-api-v2.pump.fun';
+
+// Bonding curve graduation threshold (85 SOL)
+const BONDING_CURVE_SOL_TARGET = 85;
+
+// Cached SOL price (refreshed periodically)
+let cachedSolPrice: { price: number; timestamp: number } | null = null;
+const SOL_PRICE_CACHE_MS = 30000; // 30 seconds
+
+// ETag cache for API responses (reduces bandwidth via 304 Not Modified)
+interface ETagCacheEntry<T> {
+  etag: string;
+  data: T;
+  timestamp: number;
+}
+const etagCache: Map<string, ETagCacheEntry<unknown>> = new Map();
+const ETAG_CACHE_TTL_MS = 60000; // 1 minute max TTL before forcing refresh
+
 // Token data cache (populated from trade events)
 const tokenCache: Map<string, PumpPortalToken> = new Map();
 const tradeCache: Map<string, PumpPortalTrade[]> = new Map();
@@ -456,22 +477,283 @@ export function clearCaches(): void {
 // ============================================
 
 /**
- * Fetch token data by subscribing temporarily
- * This is a helper for one-off token lookups
+ * Pump.fun REST API response type for /coins/{mint}
+ * Based on frontend-api-v3.pump.fun OpenAPI spec
+ */
+interface PumpFunApiResponse {
+  mint: string;
+  name: string;
+  symbol: string;
+  description?: string;
+  image_uri?: string;
+  creator: string;
+  created_timestamp: number;
+  bonding_curve?: string;
+  associated_bonding_curve?: string;
+  virtual_sol_reserves: number;
+  virtual_token_reserves: number;
+  real_sol_reserves: number;
+  real_token_reserves: number;
+  total_supply: number;
+  market_cap: number;
+  usd_market_cap: number;
+  market_cap_usd?: number;
+  market_cap_sol?: number;
+  price?: number;
+  price_usd?: number;
+  price_sol?: number;
+  complete: boolean;
+  raydium_pool?: string;
+  website?: string;
+  twitter?: string;
+  telegram?: string;
+  reply_count?: number;
+  last_reply?: number;
+}
+
+/**
+ * Fetch SOL price from Pump.fun API
+ * Uses /sol-price endpoint from frontend-api-v3
+ */
+async function fetchSolPriceFromPumpFun(): Promise<number> {
+  // Return cached price if fresh enough
+  if (cachedSolPrice && Date.now() - cachedSolPrice.timestamp < SOL_PRICE_CACHE_MS) {
+    return cachedSolPrice.price;
+  }
+  
+  try {
+    const response = await fetch(`${PUMPFUN_API_URL}/sol-price`, {
+      headers: {
+        'Accept': 'application/json',
+        'Origin': 'https://pump.fun',
+      },
+    });
+    
+    if (!response.ok) {
+      logger.debug(`SOL price API returned ${response.status}`);
+      return cachedSolPrice?.price || 150; // Fallback
+    }
+    
+    const data = await response.json() as { solPrice: number } | number;
+    
+    // API might return { solPrice: number } or just a number
+    const price = typeof data === 'number' ? data : (data.solPrice || 150);
+    
+    cachedSolPrice = { price, timestamp: Date.now() };
+    logger.debug(`SOL price updated: $${price}`);
+    
+    return price;
+  } catch (error) {
+    logger.debug(`Failed to fetch SOL price: ${error}`);
+    return cachedSolPrice?.price || 150; // Fallback
+  }
+}
+
+/**
+ * Export SOL price fetcher for use by other modules
+ */
+export async function getSolPrice(): Promise<number> {
+  return fetchSolPriceFromPumpFun();
+}
+
+/**
+ * Convert API response to PumpPortalToken
+ */
+async function convertApiResponseToToken(data: PumpFunApiResponse): Promise<PumpPortalToken> {
+  // Fetch current SOL price for USD calculations
+  const solPrice = await fetchSolPriceFromPumpFun();
+  
+  // Check if token is graduated (moved to Raydium)
+  const isGraduated = data.complete === true || data.raydium_pool != null;
+  
+  // Handle timestamp - API returns Unix seconds, convert to milliseconds
+  // Detect format: if timestamp is < year 2000 in ms, it's probably seconds
+  let createdTimestamp = data.created_timestamp || 0;
+  if (createdTimestamp > 0 && createdTimestamp < 1e12) {
+    // Timestamp is in seconds, convert to milliseconds
+    createdTimestamp = createdTimestamp * 1000;
+  }
+  const ageMinutes = createdTimestamp > 0 
+    ? (Date.now() - createdTimestamp) / 1000 / 60 
+    : 0;
+  
+  // Calculate derived values
+  // Note: For graduated tokens, reserves may be 0 as liquidity moved to Raydium
+  const virtualSolReserves = (data.virtual_sol_reserves || 0) / LAMPORTS_PER_SOL;
+  const virtualTokenReserves = (data.virtual_token_reserves || 1) / 1e6; // Avoid divide by zero
+  const realSolReserves = (data.real_sol_reserves || 0) / LAMPORTS_PER_SOL;
+  const priceSol = data.price_sol || (virtualTokenReserves > 0 ? virtualSolReserves / virtualTokenReserves : 0);
+  const priceUsd = data.price_usd || (data.price ? data.price : priceSol * solPrice);
+  
+  // For graduated tokens, bonding curve is 100%
+  const bondingCurveProgress = isGraduated 
+    ? 100 
+    : Math.min(100, (realSolReserves / BONDING_CURVE_SOL_TARGET) * 100);
+  
+  // Market cap handling:
+  // - usd_market_cap: Direct USD value from API
+  // - market_cap: Value in lamports (SOL)
+  // For graduated tokens, both might be 0 from pump.fun API (liquidity moved to Raydium)
+  const rawMarketCap = data.market_cap || 0;
+  let marketCapUsd =
+    data.usd_market_cap ||
+    data.market_cap_usd ||
+    0;
+  let marketCapSol =
+    data.market_cap_sol ||
+    0;
+  
+  // If market cap is 0 but we have reserves, estimate from reserves
+  if (marketCapUsd === 0 && marketCapSol === 0 && rawMarketCap > 0) {
+    // Heuristic: if market_cap looks like lamports (> 1e9), treat as SOL lamports
+    if (rawMarketCap > 1e9) {
+      marketCapSol = rawMarketCap / LAMPORTS_PER_SOL;
+      marketCapUsd = marketCapSol * solPrice;
+    } else {
+      // Otherwise assume market_cap is already USD
+      marketCapUsd = rawMarketCap;
+      marketCapSol = marketCapUsd / solPrice;
+    }
+  }
+
+  if (marketCapUsd === 0 && marketCapSol === 0 && virtualSolReserves > 0) {
+    // Total supply is typically 1 billion for pump.fun tokens
+    const totalSupply = (data.total_supply || 1e9 * 1e6) / 1e6;
+    marketCapSol = priceSol * totalSupply;
+    marketCapUsd = marketCapSol * solPrice;
+  }
+
+  if (marketCapUsd === 0 && marketCapSol > 0) {
+    marketCapUsd = marketCapSol * solPrice;
+  } else if (marketCapSol === 0 && marketCapUsd > 0) {
+    marketCapSol = marketCapUsd / solPrice;
+  }
+  
+  // Logging for troubleshooting (visible level)
+  if (ageMinutes < 1 || marketCapUsd === 0) {
+    logger.warn(`API data check - ${data.symbol}: raw_timestamp=${data.created_timestamp}, converted_ts=${createdTimestamp}, age=${ageMinutes.toFixed(1)}min, raw_mcap=${rawMarketCap}, raw_usd_mcap=${data.usd_market_cap || data.market_cap_usd || 0}, price_sol=${priceSol.toFixed(6)}, price_usd=${priceUsd.toFixed(6)}, calculated_mcap=$${marketCapUsd.toFixed(0)}`);
+  }
+  
+  return {
+    mint: data.mint,
+    name: data.name,
+    symbol: data.symbol,
+    description: data.description,
+    imageUri: data.image_uri,
+    creator: data.creator,
+    createdTimestamp,
+    ageMinutes,
+    bondingCurve: data.bonding_curve,
+    virtualSolReserves,
+    virtualTokenReserves,
+    realSolReserves,
+    priceSol,
+    priceUsd,
+    marketCapSol,
+    marketCapUsd,
+    bondingCurveProgress,
+    isGraduated,
+    website: data.website,
+    twitter: data.twitter,
+    telegram: data.telegram,
+    tradeCount: data.reply_count || 0,
+    lastTradeTimestamp: data.last_reply,
+  };
+}
+
+/**
+ * Fetch token data via Pump.fun REST API
+ * More reliable than WebSocket for one-off lookups (doesn't require active trades)
+ * Uses ?sync=true to get fresh on-chain data
+ * Supports ETag caching for bandwidth optimization (304 Not Modified)
+ */
+async function fetchTokenViaRestApi(mint: string): Promise<PumpPortalToken | null> {
+  const cacheKey = `coins:${mint}`;
+  const url = `${PUMPFUN_API_URL}/coins/${mint}?sync=true`;
+  
+  try {
+    logger.debug(`Fetching token via REST API: ${mint.slice(0, 8)}...`);
+    
+    // Build headers with ETag support
+    const headers: Record<string, string> = {
+      'Accept': 'application/json',
+      'Origin': 'https://pump.fun',
+    };
+    
+    // Include If-None-Match header if we have a cached ETag
+    const cached = etagCache.get(cacheKey) as ETagCacheEntry<PumpFunApiResponse> | undefined;
+    if (cached && Date.now() - cached.timestamp < ETAG_CACHE_TTL_MS) {
+      headers['If-None-Match'] = cached.etag;
+    }
+    
+    const response = await fetch(url, { headers });
+    
+    // Handle 304 Not Modified - return cached data
+    if (response.status === 304 && cached) {
+      logger.debug(`REST API cache hit (304) for ${mint.slice(0, 8)}...`);
+      return convertApiResponseToToken(cached.data);
+    }
+    
+    if (!response.ok) {
+      logger.debug(`REST API returned ${response.status} for ${mint.slice(0, 8)}...`);
+      return null;
+    }
+    
+    const data = await response.json() as PumpFunApiResponse;
+    
+    // Store ETag for future requests
+    const etag = response.headers.get('etag');
+    if (etag) {
+      etagCache.set(cacheKey, {
+        etag,
+        data,
+        timestamp: Date.now(),
+      });
+      logger.debug(`REST API cached with ETag: ${etag.slice(0, 20)}...`);
+    }
+    
+    const token = await convertApiResponseToToken(data);
+    
+    logger.debug(`REST API success: ${data.symbol} (${data.name}) - graduated: ${token.isGraduated}, mcap: $${token.marketCapUsd.toLocaleString()}`);
+    return token;
+    
+  } catch (error) {
+    logger.debug(`REST API fetch failed: ${error}`);
+    return null;
+  }
+}
+
+/**
+ * Fetch token data - tries REST API first, falls back to WebSocket
+ * REST API is more reliable for inactive tokens
  */
 export async function fetchTokenViaPumpPortal(
   mint: string,
   timeoutMs: number = 5000
 ): Promise<PumpPortalToken | null> {
-  // Check cache first
+  // 1. Check cache first
   const cached = getCachedToken(mint);
   if (cached) {
     // Update age
     cached.ageMinutes = (Date.now() - cached.createdTimestamp) / 1000 / 60;
-    return cached;
+    // If cache has market cap info, use it; otherwise try REST for richer data
+    const hasMarketCap = cached.marketCapUsd > 0 || cached.marketCapSol > 0;
+    if (hasMarketCap) {
+      return cached;
+    }
+    logger.debug(`Cached token missing market cap, refreshing via REST: ${mint.slice(0, 8)}...`);
   }
   
-  // Subscribe and wait for data
+  // 2. Try REST API first (works for any token, even inactive ones)
+  const restToken = await fetchTokenViaRestApi(mint);
+  if (restToken) {
+    tokenCache.set(mint, restToken);
+    return restToken;
+  }
+  
+  // 3. Fallback to WebSocket (for very new tokens not yet indexed by REST API)
+  logger.debug(`REST API failed, trying WebSocket for ${mint.slice(0, 8)}...`);
+  
   return new Promise((resolve) => {
     const timeout = setTimeout(() => {
       unsubscribe();
@@ -534,4 +816,484 @@ export async function waitForNewTokens(
       }
     });
   });
+}
+
+// ============================================
+// ADDITIONAL API ENDPOINTS
+// ============================================
+
+/**
+ * Batch fetch metadata for multiple coin mints
+ * POST /coins/mints - More efficient than individual lookups
+ */
+export async function fetchMultipleTokens(mints: string[]): Promise<PumpPortalToken[]> {
+  try {
+    const response = await fetch(`${PUMPFUN_API_URL}/coins/mints`, {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Origin': 'https://pump.fun',
+      },
+      body: JSON.stringify({ mints }),
+    });
+    
+    if (!response.ok) {
+      logger.debug(`Batch fetch returned ${response.status}`);
+      return [];
+    }
+    
+    const dataArray = await response.json() as PumpFunApiResponse[];
+    const tokens: PumpPortalToken[] = [];
+    
+    for (const data of dataArray) {
+      if (data && data.mint) {
+        const token = await convertApiResponseToToken(data);
+        tokens.push(token);
+        tokenCache.set(data.mint, token);
+      }
+    }
+    
+    logger.debug(`Batch fetched ${tokens.length} tokens`);
+    return tokens;
+  } catch (error) {
+    logger.debug(`Batch fetch failed: ${error}`);
+    return [];
+  }
+}
+
+/**
+ * Get currently live coins on pump.fun
+ * GET /coins/currently-live
+ */
+export async function fetchCurrentlyLiveCoins(
+  limit: number = 50,
+  offset: number = 0,
+  includeNsfw: boolean = false
+): Promise<PumpPortalToken[]> {
+  try {
+    const params = new URLSearchParams({
+      limit: limit.toString(),
+      offset: offset.toString(),
+      includeNsfw: includeNsfw.toString(),
+    });
+    
+    const response = await fetch(`${PUMPFUN_API_URL}/coins/currently-live?${params}`, {
+      headers: {
+        'Accept': 'application/json',
+        'Origin': 'https://pump.fun',
+      },
+    });
+    
+    if (!response.ok) {
+      logger.debug(`Currently live fetch returned ${response.status}`);
+      return [];
+    }
+    
+    const dataArray = await response.json() as PumpFunApiResponse[];
+    const tokens: PumpPortalToken[] = [];
+    
+    for (const data of dataArray) {
+      if (data && data.mint) {
+        const token = await convertApiResponseToToken(data);
+        tokens.push(token);
+      }
+    }
+    
+    return tokens;
+  } catch (error) {
+    logger.debug(`Currently live fetch failed: ${error}`);
+    return [];
+  }
+}
+
+/**
+ * Search coins with filtering and sorting
+ * GET /coins/search
+ */
+export async function searchCoins(options: {
+  searchTerm?: string;
+  limit?: number;
+  offset?: number;
+  sort?: 'created_timestamp' | 'market_cap' | 'reply_count';
+  order?: 'ASC' | 'DESC';
+  complete?: boolean; // true = graduated, false = still on bonding curve
+  includeNsfw?: boolean;
+}): Promise<PumpPortalToken[]> {
+  try {
+    const params = new URLSearchParams();
+    params.set('limit', (options.limit || 50).toString());
+    params.set('offset', (options.offset || 0).toString());
+    params.set('sort', options.sort || 'created_timestamp');
+    params.set('order', options.order || 'DESC');
+    params.set('includeNsfw', (options.includeNsfw || false).toString());
+    
+    if (options.searchTerm) params.set('searchTerm', options.searchTerm);
+    if (options.complete !== undefined) params.set('complete', options.complete.toString());
+    
+    const response = await fetch(`${PUMPFUN_API_URL}/coins/search?${params}`, {
+      headers: {
+        'Accept': 'application/json',
+        'Origin': 'https://pump.fun',
+      },
+    });
+    
+    if (!response.ok) {
+      logger.debug(`Search returned ${response.status}`);
+      return [];
+    }
+    
+    const dataArray = await response.json() as PumpFunApiResponse[];
+    const tokens: PumpPortalToken[] = [];
+    
+    for (const data of dataArray) {
+      if (data && data.mint) {
+        const token = await convertApiResponseToToken(data);
+        tokens.push(token);
+      }
+    }
+    
+    return tokens;
+  } catch (error) {
+    logger.debug(`Search failed: ${error}`);
+    return [];
+  }
+}
+
+/**
+ * Get current trending meta words
+ * GET /metas/current
+ */
+export async function fetchTrendingMetas(): Promise<string[]> {
+  try {
+    const response = await fetch(`${PUMPFUN_API_URL}/metas/current`, {
+      headers: {
+        'Accept': 'application/json',
+        'Origin': 'https://pump.fun',
+      },
+    });
+    
+    if (!response.ok) {
+      return [];
+    }
+    
+    const data = await response.json() as { metas?: string[] } | string[];
+    return Array.isArray(data) ? data : (data.metas || []);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Get coins that graduated to Raydium
+ * GET /coins/graduated (Advanced API v2)
+ */
+export async function fetchGraduatedCoins(
+  limit: number = 50,
+  offset: number = 0
+): Promise<PumpPortalToken[]> {
+  try {
+    const params = new URLSearchParams({
+      limit: limit.toString(),
+      offset: offset.toString(),
+    });
+    
+    const response = await fetch(`${PUMPFUN_ADVANCED_API_URL}/coins/graduated?${params}`, {
+      headers: {
+        'Accept': 'application/json',
+        'Origin': 'https://pump.fun',
+      },
+    });
+    
+    if (!response.ok) {
+      logger.debug(`Graduated coins fetch returned ${response.status}`);
+      return [];
+    }
+    
+    const dataArray = await response.json() as PumpFunApiResponse[];
+    const tokens: PumpPortalToken[] = [];
+    
+    for (const data of dataArray) {
+      if (data && data.mint) {
+        const token = await convertApiResponseToToken(data);
+        token.isGraduated = true; // Ensure graduated flag is set
+        tokens.push(token);
+      }
+    }
+    
+    return tokens;
+  } catch (error) {
+    logger.debug(`Graduated coins fetch failed: ${error}`);
+    return [];
+  }
+}
+
+/**
+ * Get most volatile coins by score
+ * GET /coins/volatile (Volatility API v2)
+ */
+export async function fetchVolatileCoins(): Promise<PumpPortalToken[]> {
+  try {
+    const response = await fetch(`${PUMPFUN_VOLATILITY_API_URL}/coins/volatile`, {
+      headers: {
+        'Accept': 'application/json',
+        'Origin': 'https://pump.fun',
+      },
+    });
+    
+    if (!response.ok) {
+      logger.debug(`Volatile coins fetch returned ${response.status}`);
+      return [];
+    }
+    
+    const dataArray = await response.json() as PumpFunApiResponse[];
+    const tokens: PumpPortalToken[] = [];
+    
+    for (const data of dataArray) {
+      if (data && data.mint) {
+        const token = await convertApiResponseToToken(data);
+        tokens.push(token);
+      }
+    }
+    
+    return tokens;
+  } catch (error) {
+    logger.debug(`Volatile coins fetch failed: ${error}`);
+    return [];
+  }
+}
+
+/**
+ * Get featured coins with holder analytics
+ * GET /coins/featured (Advanced API v2)
+ */
+export async function fetchFeaturedCoins(
+  timeWindow: '1h' | '6h' | '24h' = '24h',
+  limit: number = 50,
+  offset: number = 0
+): Promise<PumpPortalToken[]> {
+  try {
+    const params = new URLSearchParams({
+      limit: limit.toString(),
+      offset: offset.toString(),
+      includeNsfw: 'false',
+    });
+    
+    const response = await fetch(`${PUMPFUN_ADVANCED_API_URL}/coins/featured/${timeWindow}?${params}`, {
+      headers: {
+        'Accept': 'application/json',
+        'Origin': 'https://pump.fun',
+      },
+    });
+    
+    if (!response.ok) {
+      logger.debug(`Featured coins fetch returned ${response.status}`);
+      return [];
+    }
+    
+    const dataArray = await response.json() as PumpFunApiResponse[];
+    const tokens: PumpPortalToken[] = [];
+    
+    for (const data of dataArray) {
+      if (data && data.mint) {
+        const token = await convertApiResponseToToken(data);
+        tokens.push(token);
+      }
+    }
+    
+    return tokens;
+  } catch (error) {
+    logger.debug(`Featured coins fetch failed: ${error}`);
+    return [];
+  }
+}
+
+/**
+ * Get king of the hill token (highest market cap on bonding curve)
+ * GET /coins/king-of-the-hill
+ */
+export async function fetchKingOfTheHill(): Promise<PumpPortalToken | null> {
+  try {
+    const response = await fetch(`${PUMPFUN_API_URL}/coins/king-of-the-hill?includeNsfw=false`, {
+      headers: {
+        'Accept': 'application/json',
+        'Origin': 'https://pump.fun',
+      },
+    });
+    
+    if (!response.ok) {
+      return null;
+    }
+    
+    const data = await response.json() as PumpFunApiResponse;
+    if (!data || !data.mint) return null;
+    
+    return convertApiResponseToToken(data);
+  } catch {
+    return null;
+  }
+}
+
+// ============================================
+// CANDLESTICK & TRADE DATA
+// ============================================
+
+/**
+ * Pump.fun candlestick response type
+ */
+interface PumpFunCandle {
+  mint: string;
+  timestamp: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  slot: number;
+}
+
+/**
+ * Standardized candle format
+ */
+export interface PumpFunCandleData {
+  timestamp: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+/**
+ * Fetch candlestick data from pump.fun API
+ * GET /candlesticks/{mint}
+ * 
+ * @param mint - Token mint address
+ * @param timeframe - Timeframe in seconds (default 60 = 1 minute)
+ * @param limit - Number of candles to fetch
+ * @param offset - Offset for pagination
+ */
+export async function fetchPumpFunCandles(
+  mint: string,
+  timeframe: number = 60,
+  limit: number = 100,
+  offset: number = 0
+): Promise<PumpFunCandleData[]> {
+  try {
+    const params = new URLSearchParams({
+      timeframe: timeframe.toString(),
+      limit: limit.toString(),
+      offset: offset.toString(),
+    });
+    
+    const response = await fetch(`${PUMPFUN_API_URL}/candlesticks/${mint}?${params}`, {
+      headers: {
+        'Accept': 'application/json',
+        'Origin': 'https://pump.fun',
+      },
+    });
+    
+    if (!response.ok) {
+      logger.debug(`Pump.fun candles API returned ${response.status}`);
+      return [];
+    }
+    
+    const data = await response.json() as PumpFunCandle[];
+    
+    if (!Array.isArray(data)) {
+      return [];
+    }
+    
+    // Get SOL price for USD conversion
+    const solPrice = await fetchSolPriceFromPumpFun();
+    
+    return data.map(c => ({
+      timestamp: c.timestamp * 1000, // Convert to milliseconds
+      open: c.open * solPrice,
+      high: c.high * solPrice,
+      low: c.low * solPrice,
+      close: c.close * solPrice,
+      volume: c.volume * solPrice, // Convert SOL volume to USD
+    }));
+    
+  } catch (error) {
+    logger.debug(`Pump.fun candles fetch failed: ${error}`);
+    return [];
+  }
+}
+
+/**
+ * Fetch recent trades from pump.fun API
+ * GET /trades/all/{mint}
+ */
+export async function fetchPumpFunRecentTrades(
+  mint: string,
+  limit: number = 100,
+  offset: number = 0
+): Promise<{
+  signature: string;
+  timestamp: number;
+  isBuy: boolean;
+  solAmount: number;
+  tokenAmount: number;
+}[]> {
+  try {
+    const params = new URLSearchParams({
+      limit: limit.toString(),
+      offset: offset.toString(),
+      minimumSize: '0',
+    });
+    
+    const response = await fetch(`${PUMPFUN_API_URL}/trades/all/${mint}?${params}`, {
+      headers: {
+        'Accept': 'application/json',
+        'Origin': 'https://pump.fun',
+      },
+    });
+    
+    if (!response.ok) {
+      logger.debug(`Pump.fun trades API returned ${response.status}`);
+      return [];
+    }
+    
+    const data = await response.json() as any[];
+    
+    if (!Array.isArray(data)) {
+      return [];
+    }
+    
+    return data.map(t => ({
+      signature: t.signature || '',
+      timestamp: (t.timestamp || t.blockTime || 0) * 1000,
+      isBuy: t.is_buy || t.isBuy || t.txType === 'buy',
+      solAmount: (t.sol_amount || t.solAmount || 0) / LAMPORTS_PER_SOL,
+      tokenAmount: (t.token_amount || t.tokenAmount || 0) / 1e6,
+    }));
+    
+  } catch (error) {
+    logger.debug(`Pump.fun trades fetch failed: ${error}`);
+    return [];
+  }
+}
+
+/**
+ * Calculate recent volume from pump.fun trades
+ */
+export async function fetchPumpFunRecentVolume(
+  mint: string,
+  minutes: number = 5
+): Promise<{ volumeSol: number; volumeUsd: number; tradeCount: number }> {
+  const trades = await fetchPumpFunRecentTrades(mint, 200);
+  const solPrice = await fetchSolPriceFromPumpFun();
+  
+  const cutoffTime = Date.now() - (minutes * 60 * 1000);
+  const recentTrades = trades.filter(t => t.timestamp >= cutoffTime);
+  
+  const volumeSol = recentTrades.reduce((sum, t) => sum + t.solAmount, 0);
+  
+  return {
+    volumeSol,
+    volumeUsd: volumeSol * solPrice,
+    tradeCount: recentTrades.length,
+  };
 }

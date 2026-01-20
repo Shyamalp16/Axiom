@@ -29,7 +29,8 @@ export async function checkTokenSafety(mintAddress: string): Promise<TokenSafety
   // Quick pattern check: all Pump.fun tokens end in 'pump'
   const looksLikePumpFun = mintAddress.toLowerCase().endsWith('pump');
   const pumpToken = looksLikePumpFun ? await fetchPumpFunToken(mintAddress) : null;
-  const isPumpFun = looksLikePumpFun && (pumpToken === null || !pumpToken.isGraduated);
+  const isPumpFunActive = looksLikePumpFun && pumpToken !== null && !pumpToken.isGraduated;
+  const isPumpFunGraduated = looksLikePumpFun && pumpToken !== null && pumpToken.isGraduated;
   
   let mintAuthorityDisabled = false;
   let freezeAuthorityDisabled = false;
@@ -39,8 +40,8 @@ export async function checkTokenSafety(mintAddress: string): Promise<TokenSafety
   let lpSolAmount = 0;
   
   try {
-    if (isPumpFun) {
-      // Pump.fun tokens - protocol enforces safety
+    if (isPumpFunActive) {
+      // Pump.fun tokens (still on bonding curve) - protocol enforces safety
       mintAuthorityDisabled = true;
       freezeAuthorityDisabled = true;
       transferTaxPercent = 0;
@@ -56,6 +57,25 @@ export async function checkTokenSafety(mintAddress: string): Promise<TokenSafety
       lpSolAmount = pumpToken?.realSolReserves || 0;
       logger.checklist('LP on Raydium/Orca', true, 'Pump.fun (bonding curve)');
       logger.checklist('Bonding curve liquidity', lpSolAmount > 0, `${lpSolAmount.toFixed(2)} SOL in curve`);
+      
+    } else if (isPumpFunGraduated) {
+      // Graduated Pump.fun token - now on Raydium
+      // These tokens still have Pump.fun characteristics but LP is on Raydium
+      mintAuthorityDisabled = true;  // Pump.fun burns mint authority on graduation
+      freezeAuthorityDisabled = true; // Pump.fun doesn't use freeze authority
+      transferTaxPercent = 0;
+      hasBlacklistWhitelist = false;
+      
+      logger.checklist('Mint authority disabled', true, 'Pump.fun graduated (protocol enforced)');
+      logger.checklist('Freeze authority disabled', true, 'Pump.fun graduated (protocol enforced)');
+      logger.checklist('Transfer tax = 0%', true, 'Pump.fun token (no tax)');
+      logger.checklist('No blacklist/whitelist', true, 'Pump.fun token');
+      
+      // LP is now on Raydium after graduation
+      lpPlatform = 'raydium';
+      const lpInfo = await fetchLPInfo(mintAddress);
+      lpSolAmount = lpInfo.solAmount;
+      logger.checklist('LP on Raydium', lpSolAmount > 0, `${lpSolAmount.toFixed(2)} SOL`);
       
     } else {
       // Standard DEX tokens - run full SPL checks
