@@ -242,3 +242,36 @@ export const JUPITER_SWAP_API_URL = 'https://quote-api.jup.ag/v6/swap';
 // SOL mint address
 export const SOL_MINT = 'So11111111111111111111111111111111111111112';
 export const WSOL_DECIMALS = 9;
+
+// ============================================
+// PUMP.FUN SPECIFIC SETTINGS
+// ============================================
+
+export const PUMP_FUN = {
+  // Bonding curve progress requirements
+  MIN_BONDING_CURVE_PROGRESS: 15, // Don't buy too early (< 15%)
+  MAX_BONDING_CURVE_PROGRESS: 85, // Don't buy about to graduate (> 85%)
+  
+  // Ideal sweet spot for entry
+  IDEAL_PROGRESS_MIN: 25,
+  IDEAL_PROGRESS_MAX: 70,
+  
+  // Market cap requirements (USD)
+  MIN_MARKET_CAP_USD: 8000,   // At least $8k mcap
+  MAX_MARKET_CAP_USD: 50000,  // Below $50k (before graduation)
+  
+  // Age requirements (different from Raydium tokens)
+  MIN_AGE_MINUTES: 2,         // Slightly younger OK on pump
+  MAX_AGE_MINUTES: 30,        // Older OK if momentum
+  BOT_WAR_ZONE_MINUTES: 1,    // < 1 min = extreme danger
+  
+  // Reply/engagement minimums
+  MIN_REPLY_COUNT: 3,         // Some engagement required
+  
+  // Graduation threshold
+  GRADUATION_SOL: 85,         // SOL needed to graduate to Raydium
+  GRADUATION_MCAP_USD: 69000, // ~$69k mcap = graduation
+  
+  // Don't trade tokens about to graduate (migration risk)
+  GRADUATION_WARNING_PERCENT: 90,
+} as const;

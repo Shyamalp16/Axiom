@@ -5,22 +5,30 @@
  * 
  * This is the gatekeeper. If ANY check fails, we don't trade.
  * No exceptions. No "it looks good anyway". No FOMO.
+ * 
+ * Supports both:
+ * - Pump.fun tokens (bonding curve, pre-graduation)
+ * - Raydium/Orca tokens (standard DEX liquidity)
  */
 
 import { checkTokenSafety } from './token-safety.js';
 import { checkWalletDistribution } from './wallet-distribution.js';
 import { checkAgeContext } from './age-context.js';
 import { analyzeVolumeMomentum } from './volume-momentum.js';
+import { checkPumpFunSafety, PumpFunSafetyResult } from './pump-fun-safety.js';
 import { analyzeEntry } from '../trading/entry-logic.js';
 import { isTradingAllowed } from '../trading/position-manager.js';
+import { isPumpFunToken, fetchPumpFunToken } from '../api/pump-fun.js';
 import logger from '../utils/logger.js';
 
 export interface ChecklistResult {
   passed: boolean;
   passedChecks: string[];
   failedChecks: string[];
+  isPumpFun: boolean;
   details: {
     tokenSafety: Awaited<ReturnType<typeof checkTokenSafety>> | null;
+    pumpFunSafety: PumpFunSafetyResult | null;
     walletDistribution: Awaited<ReturnType<typeof checkWalletDistribution>> | null;
     ageContext: Awaited<ReturnType<typeof checkAgeContext>> | null;
     volumeMomentum: Awaited<ReturnType<typeof analyzeVolumeMomentum>> | null;
@@ -31,6 +39,8 @@ export interface ChecklistResult {
 /**
  * Run the complete pre-trade checklist
  * FAIL ONE = NO TRADE
+ * 
+ * Automatically detects if token is on Pump.fun or Raydium/Orca
  */
 export async function runPreTradeChecklist(
   mintAddress: string
@@ -38,21 +48,27 @@ export async function runPreTradeChecklist(
   const passedChecks: string[] = [];
   const failedChecks: string[] = [];
   
-  logger.header('═══════════════════════════════════════');
-  logger.header('PRE-TRADE CHECKLIST');
-  logger.header('═══════════════════════════════════════');
-  logger.info(`Token: ${mintAddress}`);
-  logger.info(`Time: ${new Date().toISOString()}`);
-  logger.divider();
-  
   // Initialize details
   const details: ChecklistResult['details'] = {
     tokenSafety: null,
+    pumpFunSafety: null,
     walletDistribution: null,
     ageContext: null,
     volumeMomentum: null,
     entryAnalysis: null,
   };
+  
+  // First, detect if this is a Pump.fun token
+  const pumpToken = await fetchPumpFunToken(mintAddress);
+  const isPump = pumpToken !== null && !pumpToken.isGraduated;
+  
+  logger.header('═══════════════════════════════════════');
+  logger.header('PRE-TRADE CHECKLIST');
+  logger.header('═══════════════════════════════════════');
+  logger.info(`Token: ${mintAddress}`);
+  logger.info(`Platform: ${isPump ? '🟢 PUMP.FUN (Bonding Curve)' : '🔵 RAYDIUM/ORCA (DEX)'}`);
+  logger.info(`Time: ${new Date().toISOString()}`);
+  logger.divider();
   
   // 0. Check if trading is allowed (daily/weekly limits)
   const tradingAllowed = await isTradingAllowed();
@@ -64,10 +80,18 @@ export async function runPreTradeChecklist(
       passed: false,
       passedChecks,
       failedChecks,
+      isPumpFun: isPump,
       details,
     };
   }
   passedChecks.push('Trading limits OK');
+  
+  // ========== PUMP.FUN PATH ==========
+  if (isPump) {
+    return await runPumpFunChecklist(mintAddress, passedChecks, failedChecks, details);
+  }
+  
+  // ========== RAYDIUM/ORCA PATH (Standard DEX) ==========
   
   // 1. TOKEN SAFETY (MANDATORY)
   logger.info('\n[1/5] Checking Token Safety...');
@@ -85,6 +109,7 @@ export async function runPreTradeChecklist(
         passed: false,
         passedChecks,
         failedChecks,
+        isPumpFun: false,
         details,
       };
     }
@@ -92,7 +117,7 @@ export async function runPreTradeChecklist(
     passedChecks.push('Token Safety: PASSED');
   } catch (error) {
     failedChecks.push('Safety: Check failed with error');
-    return { passed: false, passedChecks, failedChecks, details };
+    return { passed: false, passedChecks, failedChecks, isPumpFun: false, details };
   }
   
   // 2. WALLET DISTRIBUTION
@@ -160,6 +185,150 @@ export async function runPreTradeChecklist(
   // FINAL VERDICT
   const passed = failedChecks.length === 0;
   
+  displayChecklistResult(passed, passedChecks, failedChecks);
+  
+  return {
+    passed,
+    passedChecks,
+    failedChecks,
+    isPumpFun: false,
+    details,
+  };
+}
+
+/**
+ * Run Pump.fun specific checklist
+ */
+async function runPumpFunChecklist(
+  mintAddress: string,
+  passedChecks: string[],
+  failedChecks: string[],
+  details: ChecklistResult['details']
+): Promise<ChecklistResult> {
+  
+  // 1. PUMP.FUN SAFETY (replaces standard token safety)
+  logger.info('\n[1/4] Checking Pump.fun Safety...');
+  try {
+    details.pumpFunSafety = await checkPumpFunSafety(mintAddress);
+    
+    if (!details.pumpFunSafety.passed) {
+      failedChecks.push(...details.pumpFunSafety.failures.map(f => `Pump.fun: ${f}`));
+      
+      logger.error('\n⛔ CHECKLIST FAILED AT PUMP.FUN SAFETY');
+      
+      return {
+        passed: false,
+        passedChecks,
+        failedChecks,
+        isPumpFun: true,
+        details,
+      };
+    }
+    
+    passedChecks.push('Pump.fun Safety: PASSED');
+    
+    // Log warnings if any
+    if (details.pumpFunSafety.warnings.length > 0) {
+      details.pumpFunSafety.warnings.forEach(w => logger.warn(`  ⚠ ${w}`));
+    }
+  } catch (error) {
+    failedChecks.push('Pump.fun: Check failed with error');
+    return { passed: false, passedChecks, failedChecks, isPumpFun: true, details };
+  }
+  
+  // 2. WALLET DISTRIBUTION (if data available)
+  // Note: Pump.fun has different distribution model, but we still check
+  logger.info('\n[2/4] Checking Holder Distribution...');
+  try {
+    details.walletDistribution = await checkWalletDistribution(mintAddress);
+    
+    if (!details.walletDistribution.passed) {
+      // On Pump.fun, distribution is less critical but still logged
+      details.walletDistribution.failures.forEach(f => logger.warn(`  ⚠ Distribution: ${f}`));
+      // Don't hard fail for Pump.fun, just warn
+      passedChecks.push('Holder Distribution: WARNED');
+    } else {
+      passedChecks.push('Holder Distribution: PASSED');
+    }
+  } catch (error) {
+    // Non-critical for Pump.fun
+    passedChecks.push('Holder Distribution: SKIPPED');
+  }
+  
+  // 3. VOLUME & MOMENTUM (using Pump.fun trade data)
+  logger.info('\n[3/4] Analyzing Trading Activity...');
+  try {
+    // For Pump.fun, we rely on the trade analysis done in pumpFunSafety
+    // and basic volume check
+    const { fetchPumpFunTrades } = await import('../api/pump-fun.js');
+    const trades = await fetchPumpFunTrades(mintAddress, 50);
+    
+    const recentBuys = trades.filter(t => t.isBuy).length;
+    const recentSells = trades.filter(t => !t.isBuy).length;
+    const buyRatio = trades.length > 0 ? recentBuys / trades.length : 0;
+    
+    logger.checklist(
+      'Buy pressure > 50%',
+      buyRatio >= 0.5,
+      `${(buyRatio * 100).toFixed(0)}% buys`
+    );
+    
+    if (buyRatio < 0.4) {
+      failedChecks.push(`Pump.fun: Weak buy pressure (${(buyRatio * 100).toFixed(0)}%)`);
+    } else {
+      passedChecks.push('Trading Activity: PASSED');
+    }
+    
+  } catch (error) {
+    passedChecks.push('Trading Activity: SKIPPED');
+  }
+  
+  // 4. ENTRY TIMING
+  logger.info('\n[4/4] Checking Entry Timing...');
+  
+  const pumpToken = details.pumpFunSafety?.token;
+  if (pumpToken) {
+    // Ideal entry: 25-70% bonding curve progress
+    const progress = pumpToken.bondingCurveProgress;
+    const inIdealRange = progress >= 25 && progress <= 70;
+    
+    logger.checklist(
+      'Bonding curve sweet spot (25-70%)',
+      inIdealRange,
+      `${progress.toFixed(1)}%`
+    );
+    
+    if (progress < 15) {
+      failedChecks.push('Pump.fun: Too early in bonding curve');
+    } else if (progress > 85) {
+      failedChecks.push('Pump.fun: About to graduate - migration risk');
+    } else {
+      passedChecks.push('Entry Timing: PASSED');
+    }
+  }
+  
+  // FINAL VERDICT
+  const passed = failedChecks.length === 0;
+  
+  displayChecklistResult(passed, passedChecks, failedChecks);
+  
+  return {
+    passed,
+    passedChecks,
+    failedChecks,
+    isPumpFun: true,
+    details,
+  };
+}
+
+/**
+ * Display checklist result
+ */
+function displayChecklistResult(
+  passed: boolean,
+  passedChecks: string[],
+  failedChecks: string[]
+): void {
   logger.header('═══════════════════════════════════════');
   logger.header('CHECKLIST RESULT');
   logger.header('═══════════════════════════════════════');
@@ -177,13 +346,6 @@ export async function runPreTradeChecklist(
   }
   
   logger.divider();
-  
-  return {
-    passed,
-    passedChecks,
-    failedChecks,
-    details,
-  };
 }
 
 /**

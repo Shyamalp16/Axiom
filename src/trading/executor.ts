@@ -1,6 +1,6 @@
 /**
  * TRADE EXECUTOR
- * Handles swap execution via Jupiter with proper slippage and fee settings
+ * Handles swap execution via Jupiter OR Pump.fun bonding curve
  * 
  * FEES & EXECUTION (Battle-tested):
  * - Priority fee: 0.0007 SOL
@@ -8,6 +8,10 @@
  * - Buy slippage: 10%
  * - Sell slippage: 12%
  * - Emergency sell slippage: 18%
+ * 
+ * Automatically routes:
+ * - Pump.fun tokens → Bonding curve
+ * - Graduated tokens → Jupiter (Raydium/Orca)
  */
 
 import { 
@@ -30,10 +34,15 @@ import {
   withRetry 
 } from '../utils/solana.js';
 import { Order, OrderStatus, JupiterQuote } from '../types/index.js';
+import { 
+  fetchPumpFunToken, 
+  buyOnPumpFun, 
+  sellOnPumpFun 
+} from '../api/pump-fun.js';
 import logger from '../utils/logger.js';
 
 /**
- * Execute a buy order via Jupiter
+ * Execute a buy order - auto-routes to Pump.fun or Jupiter
  */
 export async function executeBuy(
   tokenMint: string,
@@ -45,7 +54,19 @@ export async function executeBuy(
   amountReceived?: number;
   actualSlippage?: number;
   error?: string;
+  platform?: 'pump.fun' | 'jupiter';
 }> {
+  // Check if this is a Pump.fun token (not yet graduated)
+  const pumpToken = await fetchPumpFunToken(tokenMint);
+  
+  if (pumpToken && !pumpToken.isGraduated) {
+    logger.info(`🟢 Routing to PUMP.FUN (Bonding Curve)`);
+    const result = await buyOnPumpFun(tokenMint, amountSol, slippagePercent);
+    return { ...result, platform: 'pump.fun' };
+  }
+  
+  // Use Jupiter for graduated tokens or non-pump tokens
+  logger.info(`🔵 Routing to JUPITER (DEX)`);
   logger.info(`Executing BUY: ${amountSol} SOL → ${tokenMint.slice(0, 8)}...`);
   logger.info(`  Slippage: ${slippagePercent}%`);
   
@@ -103,7 +124,7 @@ export async function executeBuy(
 }
 
 /**
- * Execute a sell order via Jupiter
+ * Execute a sell order - auto-routes to Pump.fun or Jupiter
  */
 export async function executeSell(
   tokenMint: string,
@@ -116,11 +137,23 @@ export async function executeSell(
   amountReceived?: number;
   actualSlippage?: number;
   error?: string;
+  platform?: 'pump.fun' | 'jupiter';
 }> {
   const slippage = isEmergency 
     ? SLIPPAGE.EMERGENCY_SELL_SLIPPAGE_PERCENT 
     : slippagePercent;
   
+  // Check if this is a Pump.fun token (not yet graduated)
+  const pumpToken = await fetchPumpFunToken(tokenMint);
+  
+  if (pumpToken && !pumpToken.isGraduated) {
+    logger.info(`🟢 Routing SELL to PUMP.FUN (Bonding Curve)`);
+    const result = await sellOnPumpFun(tokenMint, amountTokens, slippage);
+    return { ...result, platform: 'pump.fun' };
+  }
+  
+  // Use Jupiter for graduated tokens or non-pump tokens
+  logger.info(`🔵 Routing SELL to JUPITER (DEX)`);
   logger.info(`Executing SELL: ${amountTokens} tokens → SOL`);
   logger.info(`  Slippage: ${slippage}%${isEmergency ? ' (EMERGENCY)' : ''}`);
   

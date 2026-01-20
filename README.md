@@ -2,6 +2,10 @@
 
 A battle-tested trading bot for Solana memecoins with **hard-coded discipline rules**. Built to help you survive the memecoin trenches by enforcing strict safety checks and risk management.
 
+**Supports both:**
+- 🟢 **Pump.fun** - Bonding curve tokens (pre-graduation)
+- 🔵 **Raydium/Orca** - DEX liquidity pool tokens (post-graduation)
+
 ## Philosophy
 
 > **You are not hunting 50x. You are farming clean 20-40% rotations.**
@@ -79,6 +83,15 @@ Instant exit triggers:
 - Any wallet dumps > 10% supply in < 60s
 - LP removal attempt detected
 
+### Pump.fun Specific Rules
+
+When trading on Pump.fun bonding curve:
+- Bonding curve progress: 15-85% (sweet spot: 25-70%)
+- Market cap: $8k-$50k (before graduation)
+- Age: ≥2 minutes (avoids bot war zone)
+- Minimum engagement: 3+ replies
+- Auto-routes: Pump.fun vs Jupiter based on graduation status
+
 ## Installation
 
 ```bash
@@ -155,18 +168,20 @@ src/
 │   ├── logger.ts        # Colored logging
 │   └── solana.ts        # Solana utilities
 ├── api/
-│   └── data-providers.ts # Birdeye/Helius APIs
+│   ├── data-providers.ts # Birdeye/Helius APIs
+│   └── pump-fun.ts       # Pump.fun bonding curve API
 ├── checkers/
-│   ├── token-safety.ts   # Mint/freeze/LP checks
+│   ├── token-safety.ts   # Mint/freeze/LP checks (Raydium)
+│   ├── pump-fun-safety.ts # Pump.fun specific checks
 │   ├── wallet-distribution.ts
 │   ├── age-context.ts
 │   ├── volume-momentum.ts
-│   └── pre-trade-checklist.ts
+│   └── pre-trade-checklist.ts # Auto-routes Pump vs DEX
 ├── trading/
 │   ├── entry-logic.ts    # Entry conditions
 │   ├── position-manager.ts
 │   ├── tp-sl-manager.ts  # Automated TP/SL
-│   └── executor.ts       # Jupiter swaps
+│   └── executor.ts       # Jupiter + Pump.fun swaps
 ├── monitoring/
 │   └── dev-wallet-monitor.ts
 ├── storage/
@@ -198,6 +213,14 @@ These values are **battle-tested**. Do not modify unless you have a very good re
 | Max Daily Trades | 2 |
 | Max Daily Loss | 0.2 SOL |
 | Max Weekly Loss | 0.5 SOL |
+| **Pump.fun** | |
+| Min Curve Progress | 15% |
+| Max Curve Progress | 85% |
+| Ideal Curve Range | 25-70% |
+| Min Market Cap | $8,000 |
+| Max Market Cap | $50,000 |
+| Min Age | 2 minutes |
+| Min Replies | 3 |
 
 ## Trade Logging
 
