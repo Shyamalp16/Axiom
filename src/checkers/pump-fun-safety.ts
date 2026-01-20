@@ -2,13 +2,15 @@
  * PUMP.FUN SAFETY CHECKER
  * 
  * Specialized checks for Pump.fun tokens (pre-Raydium graduation)
+ * Data source: PumpPortal WebSocket API
+ * 
  * Different rules apply because:
  * - No LP to check (uses bonding curve)
  * - Mint/freeze authorities are controlled by Pump.fun program
  * - Dev allocation is known (creator gets % of supply)
  */
 
-import { PUMP_FUN, TOKEN_SAFETY } from '../config/index.js';
+import { PUMP_FUN } from '../config/index.js';
 import { 
   fetchPumpFunToken, 
   fetchPumpFunTrades,
@@ -40,38 +42,12 @@ export async function checkPumpFunSafety(mintAddress: string): Promise<PumpFunSa
   logger.header('PUMP.FUN SAFETY CHECK');
   logger.info(`Analyzing: ${mintAddress}`);
   
-  // Check if address looks like Pump.fun token
-  const looksLikePumpFun = mintAddress.toLowerCase().endsWith('pump');
-  
-  // Fetch token data
+  // Fetch token data via PumpPortal
   const token = await fetchPumpFunToken(mintAddress);
   
   if (!token) {
-    // If API unavailable but address pattern matches, pass with limited checks
-    if (looksLikePumpFun) {
-      logger.warn('Pump.fun API unavailable - running with limited checks');
-      logger.checklist('Pump.fun token (by address)', true, 'Address ends in "pump"');
-      logger.checklist('API data', false, 'Unavailable - Cloudflare blocked');
-      
-      logger.divider();
-      logger.warn('PUMP.FUN SAFETY: PASSED WITH WARNINGS ⚠');
-      logger.warn('  ⚠ Cannot verify bonding curve, market cap, age, or engagement');
-      logger.warn('  ⚠ Proceed with extra caution or try again later');
-      
-      return {
-        passed: true, // Pass but with warnings
-        isPumpFun: true,
-        token: null,
-        bondingCurveProgress: 0,
-        marketCapUsd: 0,
-        ageMinutes: 0,
-        replyCount: 0,
-        isGraduated: false,
-        failures: [],
-        warnings: ['Pump.fun API unavailable - limited verification'],
-      };
-    }
-    
+    logger.error('Failed to fetch token data from PumpPortal');
+    logger.warn('Possible reasons: API timeout, token not found, or network issue');
     return {
       passed: false,
       isPumpFun: false,
@@ -81,7 +57,7 @@ export async function checkPumpFunSafety(mintAddress: string): Promise<PumpFunSa
       ageMinutes: 0,
       replyCount: 0,
       isGraduated: false,
-      failures: ['Not a Pump.fun token'],
+      failures: ['Token data unavailable - PumpPortal fetch failed or timed out'],
       warnings: [],
     };
   }
@@ -161,19 +137,19 @@ export async function checkPumpFunSafety(mintAddress: string): Promise<PumpFunSa
     `${token.ageMinutes.toFixed(1)} min`
   );
   
-  // 5. Check engagement (reply count)
+  // 5. Check engagement (trade count)
   if (token.replyCount < PUMP_FUN.MIN_REPLY_COUNT) {
-    warnings.push(`Low engagement: ${token.replyCount} replies`);
+    warnings.push(`Low engagement: ${token.replyCount} trades`);
   }
   
   logger.checklist(
-    `Engagement (≥ ${PUMP_FUN.MIN_REPLY_COUNT} replies)`,
+    `Engagement (≥ ${PUMP_FUN.MIN_REPLY_COUNT} trades)`,
     token.replyCount >= PUMP_FUN.MIN_REPLY_COUNT,
-    `${token.replyCount} replies`
+    `${token.replyCount} trades`
   );
   
   // 6. Check social presence
-  const hasSocial = token.twitter || token.telegram || token.website;
+  const hasSocial = !!(token.twitter || token.telegram || token.website);
   if (!hasSocial) {
     warnings.push('No social links - could be low effort');
   }
@@ -199,21 +175,22 @@ export async function checkPumpFunSafety(mintAddress: string): Promise<PumpFunSa
       !manipulation.isManipulated,
       manipulation.isManipulated ? manipulation.reason : 'Clean'
     );
+    
+    // 8. Check creator activity
+    const creatorActivity = analyzeCreatorActivity(token, recentTrades);
+    
+    if (creatorActivity.isSelling) {
+      failures.push(`Creator selling: ${creatorActivity.sellPercent.toFixed(1)}% dumped`);
+    }
+    
+    logger.checklist(
+      'Creator not dumping',
+      !creatorActivity.isSelling,
+      creatorActivity.isSelling ? `Selling ${creatorActivity.sellPercent.toFixed(1)}%` : 'Holding'
+    );
+  } else {
+    logger.checklist('Trade data', false, 'No recent trades available');
   }
-  
-  // 8. Check creator hasn't dumped
-  // On Pump.fun, creator typically gets tokens - check if they're selling aggressively
-  const creatorActivity = await analyzeCreatorActivity(token, recentTrades);
-  
-  if (creatorActivity.isSelling) {
-    failures.push(`Creator selling: ${creatorActivity.sellPercent.toFixed(1)}% dumped`);
-  }
-  
-  logger.checklist(
-    'Creator not dumping',
-    !creatorActivity.isSelling,
-    creatorActivity.isSelling ? `Selling ${creatorActivity.sellPercent.toFixed(1)}%` : 'Holding'
-  );
   
   // Final result
   const passed = failures.length === 0;
@@ -254,7 +231,7 @@ function detectTradeManipulation(
     return { isManipulated: false };
   }
   
-  // Check for wash trading (same wallet buying and selling rapidly)
+  // Check for wash trading
   const walletActivity: Map<string, { buys: number; sells: number }> = new Map();
   
   for (const trade of trades) {
@@ -267,19 +244,18 @@ function detectTradeManipulation(
     walletActivity.set(trade.user, activity);
   }
   
-  // If single wallet has both many buys and sells, suspicious
-  for (const [wallet, activity] of walletActivity) {
+  for (const [, activity] of walletActivity) {
     if (activity.buys >= 3 && activity.sells >= 3) {
       return { isManipulated: true, reason: 'Wash trading detected' };
     }
   }
   
-  // Check for coordinated buying (many buys in rapid succession from different wallets)
+  // Check for coordinated buying
   const buyTimes = trades.filter(t => t.isBuy).map(t => t.timestamp).sort();
   let rapidBuys = 0;
   
   for (let i = 1; i < buyTimes.length; i++) {
-    if (buyTimes[i] - buyTimes[i - 1] < 2000) { // Within 2 seconds
+    if (buyTimes[i] - buyTimes[i - 1] < 2000) {
       rapidBuys++;
     }
   }
@@ -294,10 +270,10 @@ function detectTradeManipulation(
 /**
  * Analyze creator selling activity
  */
-async function analyzeCreatorActivity(
+function analyzeCreatorActivity(
   token: PumpFunToken,
   trades: Awaited<ReturnType<typeof fetchPumpFunTrades>>
-): Promise<{ isSelling: boolean; sellPercent: number }> {
+): { isSelling: boolean; sellPercent: number } {
   const creatorTrades = trades.filter(t => t.user === token.creator);
   
   if (creatorTrades.length === 0) {
@@ -307,12 +283,9 @@ async function analyzeCreatorActivity(
   const sells = creatorTrades.filter(t => !t.isBuy);
   const totalSold = sells.reduce((sum, t) => sum + t.tokenAmount, 0);
   
-  // Estimate creator's initial allocation (typically small % on pump.fun)
-  const estimatedCreatorTokens = token.virtualTokenReserves * 0.02; // ~2% creator allocation
-  
+  const estimatedCreatorTokens = token.virtualTokenReserves * 0.02;
   const sellPercent = (totalSold / estimatedCreatorTokens) * 100;
   
-  // Consider selling if > 50% of allocation dumped
   return {
     isSelling: sellPercent > 50,
     sellPercent: Math.min(100, sellPercent),
@@ -320,21 +293,16 @@ async function analyzeCreatorActivity(
 }
 
 /**
- * Quick check if token is on Pump.fun and worth analyzing
+ * Quick check if token is on Pump.fun
  */
 export async function quickPumpFunCheck(mintAddress: string): Promise<{
   isPumpFun: boolean;
   shouldAnalyze: boolean;
   reason?: string;
 }> {
-  const looksLikePumpFun = mintAddress.toLowerCase().endsWith('pump');
   const token = await fetchPumpFunToken(mintAddress);
   
   if (!token) {
-    // If API unavailable but address pattern matches, still analyze
-    if (looksLikePumpFun) {
-      return { isPumpFun: true, shouldAnalyze: true, reason: 'API unavailable - using address pattern' };
-    }
     return { isPumpFun: false, shouldAnalyze: false, reason: 'Not on Pump.fun' };
   }
   
@@ -367,7 +335,7 @@ export function displayPumpFunToken(token: PumpFunToken): void {
     `Bonding Curve: ${token.bondingCurveProgress.toFixed(1)}%`,
     `SOL in Curve: ${token.realSolReserves.toFixed(2)} SOL`,
     ``,
-    `Replies: ${token.replyCount}`,
+    `Trades: ${token.replyCount}`,
     `Socials: ${[token.twitter && '𝕏', token.telegram && 'TG', token.website && 'Web'].filter(Boolean).join(' ') || 'None'}`,
   ]);
 }

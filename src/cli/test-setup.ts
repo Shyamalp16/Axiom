@@ -99,29 +99,43 @@ async function testSetup() {
     results.push({ test: 'Helius API', passed: true, detail: 'Not configured (optional)' });
   }
   
-  // 4. Test Pump.fun API (optional - no official API, Cloudflare protected)
-  logger.info('Testing Pump.fun API...');
+  // 4. Test PumpPortal WebSocket (Pump.fun data provider)
+  logger.info('Testing PumpPortal API...');
   try {
-    const response = await fetch('https://frontend-api.pump.fun/coins?limit=1', {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://pump.fun/',
-        'Origin': 'https://pump.fun',
-      },
-    });
+    const WebSocket = (await import('ws')).default;
     
-    if (response.ok) {
-      const data = await response.json();
-      results.push({ test: 'Pump.fun API', passed: true, detail: 'Connected' });
+    const testConnection = (): Promise<boolean> => {
+      return new Promise((resolve) => {
+        const timeout = setTimeout(() => {
+          resolve(false);
+        }, 5000);
+        
+        const ws = new WebSocket('wss://pumpportal.fun/api/data');
+        
+        ws.on('open', () => {
+          clearTimeout(timeout);
+          ws.close();
+          resolve(true);
+        });
+        
+        ws.on('error', () => {
+          clearTimeout(timeout);
+          resolve(false);
+        });
+      });
+    };
+    
+    const connected = await testConnection();
+    
+    if (connected) {
+      results.push({ test: 'PumpPortal API', passed: true, detail: 'WebSocket connected' });
     } else {
-      // Non-critical - Pump.fun doesn't have official API, Cloudflare blocks direct access
-      results.push({ test: 'Pump.fun API', passed: true, detail: `HTTP ${response.status} (expected - no official API)` });
+      results.push({ test: 'PumpPortal API', passed: false, detail: 'Connection failed' });
+      allPassed = false;
     }
   } catch (error) {
-    // Non-critical - this is expected since there's no official API and Cloudflare blocks it
-    results.push({ test: 'Pump.fun API', passed: true, detail: 'Unreachable (expected - Cloudflare protected)' });
+    results.push({ test: 'PumpPortal API', passed: false, detail: 'WebSocket error' });
+    allPassed = false;
   }
   
   // 5. Test Jupiter API (optional for paper trading)

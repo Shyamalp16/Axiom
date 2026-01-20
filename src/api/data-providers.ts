@@ -86,7 +86,7 @@ export async function fetchTokenCreationTime(mintAddress: string): Promise<Date>
       );
       
       if (response.ok) {
-        const txns = await response.json();
+        const txns = await response.json() as { timestamp?: number }[];
         if (txns.length > 0 && txns[0].timestamp) {
           return new Date(txns[0].timestamp * 1000);
         }
@@ -349,7 +349,7 @@ export async function fetchSolPrice(): Promise<number> {
     const response = await fetch(
       'https://price.jup.ag/v4/price?ids=SOL'
     );
-    const data = await response.json();
+    const data = await response.json() as { data?: { SOL?: { price?: number } } };
     return data.data?.SOL?.price || 0;
   } catch {
     return 0;
@@ -387,8 +387,8 @@ async function birdeyeRequest<T>(endpoint: string): Promise<T> {
       throw new Error(`Birdeye API error: ${response.status}`);
     }
     
-    const json = await response.json();
-    return json.data || json;
+    const json = await response.json() as { data?: T } | T;
+    return (json as { data?: T }).data || (json as T);
   }, API_RETRY_ATTEMPTS, API_RETRY_DELAY_MS);
 }
 
@@ -409,6 +409,6 @@ async function heliusRequest<T>(
       throw new Error(`Helius API error: ${response.status}`);
     }
     
-    return response.json();
+    return response.json() as Promise<T>;
   }, API_RETRY_ATTEMPTS, API_RETRY_DELAY_MS);
 }

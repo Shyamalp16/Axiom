@@ -121,21 +121,20 @@ async function handleCheck() {
   try {
     // Get token info
     let symbol = 'UNKNOWN';
-    const pumpToken = await fetchPumpFunToken(mintAddress);
     const looksLikePumpFun = mintAddress.toLowerCase().endsWith('pump');
+    const pumpToken = looksLikePumpFun ? await fetchPumpFunToken(mintAddress) : null;
     
-    if (pumpToken) {
-      symbol = pumpToken.symbol;
-      logger.info(`Token: ${pumpToken.name} (${symbol})`);
-      logger.info(`Platform: 🟢 Pump.fun`);
-      logger.info(`Bonding Curve: ${pumpToken.bondingCurveProgress.toFixed(1)}%`);
-      logger.info(`Market Cap: $${pumpToken.marketCapUsd.toFixed(0)}`);
-    } else if (looksLikePumpFun) {
-      // Pump.fun API unavailable but address pattern matches
-      symbol = 'PUMP';
-      logger.info(`Token: Unknown (${mintAddress.slice(0, 8)}...)`);
-      logger.info(`Platform: 🟢 Pump.fun (API unavailable)`);
-      logger.warn('Pump.fun API unreachable - limited info available');
+    if (looksLikePumpFun) {
+      if (pumpToken) {
+        symbol = pumpToken.symbol;
+        logger.info(`Token: ${pumpToken.name} (${symbol})`);
+        logger.info(`Platform: 🟢 Pump.fun`);
+        logger.info(`Bonding Curve: ${pumpToken.bondingCurveProgress.toFixed(1)}%`);
+        logger.info(`Market Cap: $${pumpToken.marketCapUsd.toFixed(0)}`);
+      } else {
+        logger.info(`Token: ${mintAddress.slice(0, 8)}...`);
+        logger.info(`Platform: 🟢 Pump.fun (data pending)`);
+      }
     } else {
       const tokenInfo = await fetchTokenInfo(mintAddress);
       symbol = tokenInfo.symbol;

@@ -58,15 +58,11 @@ export async function runPreTradeChecklist(
     entryAnalysis: null,
   };
   
-  // First, detect if this is a Pump.fun token
-  // Pump.fun tokens have addresses ending in 'pump' (vanity suffix)
+  // Detect if this is a Pump.fun token
+  // Quick pattern check: all Pump.fun tokens end in 'pump'
   const looksLikePumpFun = mintAddress.toLowerCase().endsWith('pump');
-  const pumpToken = await fetchPumpFunToken(mintAddress);
-  const isPump = (pumpToken !== null && !pumpToken.isGraduated) || looksLikePumpFun;
-  
-  if (looksLikePumpFun && !pumpToken) {
-    logger.warn('Pump.fun API unavailable - using address pattern detection');
-  }
+  const pumpToken = looksLikePumpFun ? await fetchPumpFunToken(mintAddress) : null;
+  const isPump = looksLikePumpFun && (pumpToken === null || !pumpToken.isGraduated);
   
   logger.header('═══════════════════════════════════════');
   logger.header('PRE-TRADE CHECKLIST');
@@ -221,6 +217,7 @@ async function runPumpFunChecklist(
       failedChecks.push(...details.pumpFunSafety.failures.map(f => `Pump.fun: ${f}`));
       
       logger.error('\n⛔ CHECKLIST FAILED AT PUMP.FUN SAFETY');
+      details.pumpFunSafety.failures.forEach(f => logger.error(`  → ${f}`));
       
       return {
         passed: false,

@@ -263,7 +263,7 @@ async function getJupiterQuote(
       throw new Error(`Jupiter quote failed: ${response.status}`);
     }
     
-    return response.json();
+    return response.json() as Promise<JupiterQuote>;
   });
 }
 
@@ -292,7 +292,7 @@ async function getJupiterSwapTransaction(
       throw new Error(`Jupiter swap failed: ${response.status}`);
     }
     
-    const data = await response.json();
+    const data = await response.json() as { swapTransaction: string };
     
     // Decode the transaction
     const swapTransaction = VersionedTransaction.deserialize(

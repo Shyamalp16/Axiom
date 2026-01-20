@@ -3,25 +3,39 @@
  * 
  * Pump.fun is where most Solana memecoins launch before migrating to Raydium.
  * This module handles:
- * - Token data from Pump.fun API
+ * - Token data via PumpPortal WebSocket API
  * - Bonding curve trading (pre-Raydium)
  * - Graduation detection (when it moves to Raydium)
+ * 
+ * Data source: PumpPortal (https://pumpportal.fun)
  */
 
-import { PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL } from '@solana/web3.js';
-import { getConnection, getWallet, sendAndConfirmTransaction, withRetry } from '../utils/solana.js';
+import { PublicKey, Transaction, LAMPORTS_PER_SOL } from '@solana/web3.js';
+import { getWallet, sendAndConfirmTransaction } from '../utils/solana.js';
 import { SLIPPAGE, FEES_EXECUTION } from '../config/index.js';
 import logger from '../utils/logger.js';
+import {
+  connectPumpPortal,
+  subscribeTokenTrades,
+  subscribeNewTokens,
+  subscribeMigrations,
+  getCachedToken,
+  getCachedTrades,
+  fetchTokenViaPumpPortal,
+  waitForNewTokens,
+  isConnectedToPumpPortal,
+  PumpPortalToken,
+  PumpPortalTrade,
+  PumpPortalNewToken,
+} from './pump-portal.js';
 
-// Pump.fun constants
-const PUMP_FUN_API = 'https://frontend-api.pump.fun';
+// Pump.fun program constants
 const PUMP_FUN_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
-const PUMP_FUN_GLOBAL = new PublicKey('4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf');
-const PUMP_FUN_FEE_RECIPIENT = new PublicKey('CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM');
-
-// Graduation threshold (when token moves to Raydium)
-const GRADUATION_MARKET_CAP_USD = 69000; // ~$69k market cap = graduation
 const BONDING_CURVE_SOL_TARGET = 85; // SOL needed to graduate
+
+// ============================================
+// TYPES (backwards compatible)
+// ============================================
 
 export interface PumpFunToken {
   mint: string;
@@ -73,77 +87,99 @@ export interface PumpFunTrade {
   slot: number;
 }
 
+// ============================================
+// INITIALIZATION
+// ============================================
+
+let initialized = false;
+
 /**
- * Fetch token data from Pump.fun
+ * Initialize PumpPortal connection
+ */
+export async function initializePumpFunApi(): Promise<void> {
+  if (initialized) return;
+  
+  try {
+    await connectPumpPortal();
+    initialized = true;
+    logger.success('Pump.fun API initialized (via PumpPortal)');
+  } catch (error) {
+    logger.error('Failed to initialize Pump.fun API:', error);
+    throw error;
+  }
+}
+
+/**
+ * Check if connected to PumpPortal
+ */
+export function isPumpFunApiConnected(): boolean {
+  return isConnectedToPumpPortal();
+}
+
+// ============================================
+// TOKEN DATA FUNCTIONS
+// ============================================
+
+/**
+ * Fetch token data from PumpPortal
  */
 export async function fetchPumpFunToken(mintAddress: string): Promise<PumpFunToken | null> {
   try {
-    const response = await fetch(`${PUMP_FUN_API}/coins/${mintAddress}`);
-    
-    if (!response.ok) {
-      if (response.status === 404) {
-        return null; // Not a pump.fun token
-      }
-      throw new Error(`Pump.fun API error: ${response.status}`);
+    // Ensure connected
+    if (!isConnectedToPumpPortal()) {
+      await connectPumpPortal();
     }
     
-    const data = await response.json();
+    // Get from cache or fetch via subscription
+    let portalToken = getCachedToken(mintAddress);
     
-    // Calculate age
-    const createdTimestamp = data.created_timestamp || Date.now();
-    const ageMinutes = (Date.now() - createdTimestamp) / 1000 / 60;
+    if (!portalToken) {
+      // Subscribe to get data
+      portalToken = await fetchTokenViaPumpPortal(mintAddress, 5000);
+    }
     
-    // Calculate bonding curve progress
-    const realSolReserves = (data.real_sol_reserves || 0) / LAMPORTS_PER_SOL;
-    const bondingCurveProgress = Math.min(100, (realSolReserves / BONDING_CURVE_SOL_TARGET) * 100);
+    if (!portalToken) {
+      return null;
+    }
     
-    // Check if graduated (moved to Raydium)
-    const isGraduated = data.raydium_pool !== null && data.raydium_pool !== undefined;
-    
-    // Calculate price from bonding curve
-    const virtualSolReserves = (data.virtual_sol_reserves || 0) / LAMPORTS_PER_SOL;
-    const virtualTokenReserves = (data.virtual_token_reserves || 1) / 1e6; // 6 decimals
-    const priceSol = virtualSolReserves / virtualTokenReserves;
-    
-    // Get USD price (estimate)
+    // Get SOL price for USD calculations
     const solPriceUsd = await getSolPriceUsd();
-    const priceUsd = priceSol * solPriceUsd;
-    const marketCapUsd = data.usd_market_cap || (priceUsd * 1_000_000_000); // 1B supply
-    const marketCapSol = marketCapUsd / solPriceUsd;
     
-    return {
-      mint: mintAddress,
-      name: data.name || 'Unknown',
-      symbol: data.symbol || 'UNKNOWN',
-      description: data.description || '',
-      imageUri: data.image_uri || '',
-      creator: data.creator || '',
-      createdTimestamp,
-      ageMinutes,
+    // Convert to PumpFunToken format
+    const token: PumpFunToken = {
+      mint: portalToken.mint,
+      name: portalToken.name,
+      symbol: portalToken.symbol,
+      description: portalToken.description || '',
+      imageUri: portalToken.imageUri || '',
+      creator: portalToken.creator,
+      createdTimestamp: portalToken.createdTimestamp,
+      ageMinutes: portalToken.ageMinutes,
       
-      bondingCurve: data.bonding_curve || '',
-      associatedBondingCurve: data.associated_bonding_curve || '',
-      virtualSolReserves,
-      virtualTokenReserves,
-      realSolReserves,
-      realTokenReserves: (data.real_token_reserves || 0) / 1e6,
+      bondingCurve: portalToken.bondingCurve || '',
+      associatedBondingCurve: '',
+      virtualSolReserves: portalToken.virtualSolReserves,
+      virtualTokenReserves: portalToken.virtualTokenReserves,
+      realSolReserves: portalToken.realSolReserves,
+      realTokenReserves: 0,
       
-      priceUsd,
-      priceSol,
-      marketCapUsd,
-      marketCapSol,
+      priceUsd: portalToken.priceSol * solPriceUsd,
+      priceSol: portalToken.priceSol,
+      marketCapUsd: portalToken.marketCapSol * solPriceUsd,
+      marketCapSol: portalToken.marketCapSol,
       
-      bondingCurveProgress,
-      isGraduated,
-      raydiumPool: data.raydium_pool,
+      bondingCurveProgress: Math.min(100, (portalToken.realSolReserves / BONDING_CURVE_SOL_TARGET) * 100),
+      isGraduated: portalToken.isGraduated,
       
-      website: data.website,
-      twitter: data.twitter,
-      telegram: data.telegram,
+      website: portalToken.website,
+      twitter: portalToken.twitter,
+      telegram: portalToken.telegram,
       
-      replyCount: data.reply_count || 0,
-      lastReply: data.last_reply,
+      replyCount: portalToken.tradeCount, // Use trade count as engagement metric
+      lastReply: portalToken.lastTradeTimestamp,
     };
+    
+    return token;
     
   } catch (error) {
     logger.debug(`Pump.fun fetch failed: ${error}`);
@@ -155,6 +191,11 @@ export async function fetchPumpFunToken(mintAddress: string): Promise<PumpFunTok
  * Check if a token is on Pump.fun
  */
 export async function isPumpFunToken(mintAddress: string): Promise<boolean> {
+  // Quick check by address pattern (Pump.fun tokens end in 'pump')
+  if (mintAddress.toLowerCase().endsWith('pump')) {
+    return true;
+  }
+  
   const token = await fetchPumpFunToken(mintAddress);
   return token !== null;
 }
@@ -167,50 +208,53 @@ export async function fetchPumpFunTrades(
   limit: number = 50
 ): Promise<PumpFunTrade[]> {
   try {
-    const response = await fetch(
-      `${PUMP_FUN_API}/trades/latest?mint=${mintAddress}&limit=${limit}`
-    );
-    
-    if (!response.ok) {
-      return [];
+    // Ensure connected
+    if (!isConnectedToPumpPortal()) {
+      await connectPumpPortal();
     }
     
-    const trades = await response.json();
+    // Get cached trades
+    const portalTrades = getCachedTrades(mintAddress);
     
-    return trades.map((t: any) => ({
-      signature: t.signature,
-      mint: t.mint,
-      solAmount: (t.sol_amount || 0) / LAMPORTS_PER_SOL,
-      tokenAmount: (t.token_amount || 0) / 1e6,
-      isBuy: t.is_buy,
-      user: t.user,
-      timestamp: t.timestamp,
-      slot: t.slot,
-    }));
+    if (portalTrades.length === 0) {
+      // Subscribe to start receiving trades
+      subscribeTokenTrades([mintAddress], () => {});
+      
+      // Wait a moment for trades to come in
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
     
+    // Convert to PumpFunTrade format
+    return getCachedTrades(mintAddress)
+      .slice(0, limit)
+      .map((t: PumpPortalTrade) => ({
+        signature: t.signature,
+        mint: t.mint,
+        solAmount: t.solAmount / LAMPORTS_PER_SOL,
+        tokenAmount: t.tokenAmount / 1e6,
+        isBuy: t.txType === 'buy',
+        user: t.traderPublicKey,
+        timestamp: t.timestamp,
+        slot: 0,
+      }));
+      
   } catch {
     return [];
   }
 }
 
 /**
- * Fetch new tokens from Pump.fun
+ * Fetch new tokens from Pump.fun (via PumpPortal stream)
  */
 export async function fetchNewPumpFunTokens(limit: number = 20): Promise<PumpFunToken[]> {
   try {
-    const response = await fetch(
-      `${PUMP_FUN_API}/coins?offset=0&limit=${limit}&sort=created_timestamp&order=DESC&includeNsfw=false`
-    );
+    // Get new tokens via WebSocket
+    const newTokens = await waitForNewTokens(limit, 30000);
     
-    if (!response.ok) {
-      return [];
-    }
-    
-    const coins = await response.json();
     const tokens: PumpFunToken[] = [];
     
-    for (const coin of coins) {
-      const token = await fetchPumpFunToken(coin.mint);
+    for (const newToken of newTokens) {
+      const token = await fetchPumpFunToken(newToken.mint);
       if (token) {
         tokens.push(token);
       }
@@ -224,23 +268,31 @@ export async function fetchNewPumpFunTokens(limit: number = 20): Promise<PumpFun
 }
 
 /**
- * Get king of the hill token (highest market cap not graduated)
+ * Subscribe to new token creation events
  */
-export async function fetchKingOfTheHill(): Promise<PumpFunToken | null> {
-  try {
-    const response = await fetch(`${PUMP_FUN_API}/coins/king-of-the-hill`);
-    
-    if (!response.ok) {
-      return null;
-    }
-    
-    const data = await response.json();
-    return fetchPumpFunToken(data.mint);
-    
-  } catch {
-    return null;
-  }
+export function onNewPumpFunToken(handler: (token: PumpPortalNewToken) => void): () => void {
+  return subscribeNewTokens(handler);
 }
+
+/**
+ * Subscribe to token trade events
+ */
+export function onPumpFunTrade(mint: string, handler: (trade: PumpPortalTrade) => void): () => void {
+  return subscribeTokenTrades([mint], handler);
+}
+
+/**
+ * Subscribe to token graduation events
+ */
+export function onPumpFunGraduation(handler: (event: { mint: string; pool: string }) => void): () => void {
+  return subscribeMigrations((event) => {
+    handler({ mint: event.mint, pool: event.pool });
+  });
+}
+
+// ============================================
+// BONDING CURVE CALCULATIONS
+// ============================================
 
 /**
  * Calculate buy quote for Pump.fun bonding curve
@@ -284,6 +336,10 @@ export function calculatePumpFunSellQuote(
   return { solAmount, priceImpact };
 }
 
+// ============================================
+// TRADING FUNCTIONS
+// ============================================
+
 /**
  * Buy tokens on Pump.fun bonding curve
  */
@@ -320,39 +376,12 @@ export async function buyOnPumpFun(
       };
     }
     
-    // Calculate minimum tokens with slippage
-    const minTokens = quote.tokenAmount * (1 - slippagePercent / 100);
-    
-    // Build transaction using Pump.fun's buy endpoint
-    const wallet = getWallet();
-    
-    const response = await fetch(`${PUMP_FUN_API}/trade/buy`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        mint: mintAddress,
-        amount: Math.floor(solAmount * LAMPORTS_PER_SOL),
-        slippage: slippagePercent / 100,
-        priorityFee: FEES_EXECUTION.PRIORITY_FEE_SOL,
-        userPublicKey: wallet.publicKey.toBase58(),
-      }),
-    });
-    
-    if (!response.ok) {
-      // Fallback: construct transaction manually
-      return await executePumpFunBuyManual(token, solAmount, minTokens);
-    }
-    
-    const txData = await response.json();
-    const transaction = Transaction.from(Buffer.from(txData.transaction, 'base64'));
-    
-    const signature = await sendAndConfirmTransaction(transaction);
-    
-    logger.success(`Pump.fun BUY executed: ${signature}`);
+    // For paper trading, just return success with calculated amount
+    // Real trading would require transaction building
+    logger.success(`Pump.fun BUY simulated: ${quote.tokenAmount.toFixed(2)} tokens`);
     
     return {
       success: true,
-      signature,
       tokenAmount: quote.tokenAmount,
     };
     
@@ -396,38 +425,11 @@ export async function sellOnPumpFun(
       logger.warn(`High price impact: ${quote.priceImpact.toFixed(2)}%`);
     }
     
-    // Calculate minimum SOL with slippage
-    const minSol = quote.solAmount * (1 - slippagePercent / 100);
-    
-    // Build transaction
-    const wallet = getWallet();
-    
-    const response = await fetch(`${PUMP_FUN_API}/trade/sell`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        mint: mintAddress,
-        amount: Math.floor(tokenAmount * 1e6), // 6 decimals
-        slippage: slippagePercent / 100,
-        priorityFee: FEES_EXECUTION.PRIORITY_FEE_SOL,
-        userPublicKey: wallet.publicKey.toBase58(),
-      }),
-    });
-    
-    if (!response.ok) {
-      return await executePumpFunSellManual(token, tokenAmount, minSol);
-    }
-    
-    const txData = await response.json();
-    const transaction = Transaction.from(Buffer.from(txData.transaction, 'base64'));
-    
-    const signature = await sendAndConfirmTransaction(transaction);
-    
-    logger.success(`Pump.fun SELL executed: ${signature}`);
+    // For paper trading, return success with calculated amount
+    logger.success(`Pump.fun SELL simulated: ${quote.solAmount.toFixed(4)} SOL`);
     
     return {
       success: true,
-      signature,
       solAmount: quote.solAmount,
     };
     
@@ -438,35 +440,9 @@ export async function sellOnPumpFun(
   }
 }
 
-/**
- * Manual buy execution (fallback)
- */
-async function executePumpFunBuyManual(
-  token: PumpFunToken,
-  solAmount: number,
-  minTokens: number
-): Promise<{ success: boolean; signature?: string; tokenAmount?: number; error?: string }> {
-  // This would construct the transaction manually using Pump.fun's program
-  // For now, return error as this requires complex instruction building
-  return { 
-    success: false, 
-    error: 'Manual transaction building not implemented - use Pump.fun website' 
-  };
-}
-
-/**
- * Manual sell execution (fallback)
- */
-async function executePumpFunSellManual(
-  token: PumpFunToken,
-  tokenAmount: number,
-  minSol: number
-): Promise<{ success: boolean; signature?: string; solAmount?: number; error?: string }> {
-  return { 
-    success: false, 
-    error: 'Manual transaction building not implemented - use Pump.fun website' 
-  };
-}
+// ============================================
+// UTILITY FUNCTIONS
+// ============================================
 
 /**
  * Get SOL price in USD
@@ -474,8 +450,8 @@ async function executePumpFunSellManual(
 async function getSolPriceUsd(): Promise<number> {
   try {
     const response = await fetch('https://price.jup.ag/v4/price?ids=SOL');
-    const data = await response.json();
-    return data.data?.SOL?.price || 150; // Fallback to $150
+    const data = await response.json() as { data?: { SOL?: { price?: number } } };
+    return data.data?.SOL?.price || 150;
   } catch {
     return 150;
   }
@@ -522,9 +498,9 @@ export function analyzePumpFunSafety(token: PumpFunToken): {
     score -= 10;
   }
   
-  // Check reply count (engagement)
+  // Check engagement (trade count)
   if (token.replyCount < 5) {
-    warnings.push('Low engagement (< 5 replies)');
+    warnings.push('Low engagement (< 5 trades)');
     score -= 5;
   }
   

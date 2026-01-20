@@ -12,7 +12,7 @@ import { POSITION_SIZING, DAILY_LIMITS, WEEKLY_LIMITS } from '../config/index.js
 import { Position, Tranche, PositionStatus, Order, OrderReason } from '../types/index.js';
 import { getWalletBalance } from '../utils/solana.js';
 import logger from '../utils/logger.js';
-import { v4 as uuidv4 } from 'crypto';
+import { randomUUID as uuidv4 } from 'crypto';
 
 // In-memory position store (would use DB in production)
 let activePositions: Position[] = [];
@@ -54,7 +54,7 @@ export async function calculateTradeSize(): Promise<{
   const availableBalance = Math.max(0, balance - feeBuffer);
   
   // Determine trade size
-  let size = POSITION_SIZING.IDEAL_PER_TRADE_SOL;
+  let size: number = POSITION_SIZING.IDEAL_PER_TRADE_SOL;
   
   // Cap at max
   size = Math.min(size, POSITION_SIZING.MAX_PER_TRADE_SOL);
