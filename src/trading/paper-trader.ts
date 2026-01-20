@@ -48,6 +48,10 @@ export interface PaperTrade {
   exitPrice?: number;
   pnl?: number;
   pnlPercent?: number;
+  grossPnl?: number;
+  grossPnlPercent?: number;
+  netPnl?: number;
+  netPnlPercent?: number;
   
   // Checklist that passed
   checklistPassed: string[];
@@ -96,6 +100,9 @@ let portfolio: PaperPortfolio = {
 };
 
 let paperTrades: PaperTrade[] = [];
+
+// Paper trading behavior flags
+const PAPER_TRADING_SKIP_FEES = true;
 
 /**
  * Load paper trades from disk
@@ -169,9 +176,52 @@ export async function paperBuy(
   if (isPump && pumpToken) {
     // Pump.fun bonding curve
     platform = 'pump.fun';
-    const quote = calculatePumpFunBuyQuote(pumpToken, solAmount);
-    tokenAmount = quote.tokenAmount * (1 - SLIPPAGE.BUY_SLIPPAGE_PERCENT / 100); // Apply slippage
-    pricePerToken = pumpToken.priceSol;
+    
+    // Log market data at entry
+    logger.info(`📝 [PAPER] Entry Market:`);
+    logger.info(`   Spot Price: ${pumpToken.priceSol.toFixed(12)} SOL/token`);
+    logger.info(`   Market Cap: $${pumpToken.marketCapUsd.toFixed(0)} (${pumpToken.marketCapSol.toFixed(2)} SOL)`);
+    logger.info(`   Reserves: ${pumpToken.virtualSolReserves.toFixed(4)} vSOL / ${pumpToken.virtualTokenReserves.toFixed(0)} vTokens`);
+    
+    // Check if reserves are valid for bonding curve calculation
+    const hasValidReserves = pumpToken.virtualSolReserves > 0.001 && pumpToken.virtualTokenReserves > 1000;
+    
+    if (hasValidReserves) {
+      const quote = calculatePumpFunBuyQuote(pumpToken, solAmount);
+      logger.info(`📝 [PAPER] Buy Quote: ${solAmount} SOL → ${quote.tokenAmount.toFixed(2)} tokens (impact: ${quote.priceImpact.toFixed(2)}%)`);
+      tokenAmount = quote.tokenAmount * (1 - SLIPPAGE.BUY_SLIPPAGE_PERCENT / 100); // Apply slippage
+      pricePerToken = tokenAmount > 0 ? solAmount / tokenAmount : pumpToken.priceSol;
+    } else {
+      // Fallback: Reserves invalid, use spot price or market cap estimate
+      // Priority: 1) spot price, 2) market cap derived, 3) bonding curve estimate
+      const PUMP_TOTAL_SUPPLY = 1_000_000_000;
+      
+      // Try spot price first (most reliable)
+      if (pumpToken.priceSol > 1e-15) {
+        pricePerToken = pumpToken.priceSol;
+        logger.warn(`📝 [PAPER] Reserves invalid, using spot price: ${pricePerToken.toExponential(4)} SOL/token`);
+      } 
+      // Try market cap derived price
+      else if (pumpToken.marketCapSol > 0) {
+        pricePerToken = pumpToken.marketCapSol / PUMP_TOTAL_SUPPLY;
+        logger.warn(`📝 [PAPER] Using market cap derived price: ${pricePerToken.toExponential(4)} SOL/token`);
+      }
+      // Last resort: estimate from bonding curve progress
+      else if (pumpToken.bondingCurveProgress > 0) {
+        // At 100% progress, market cap is ~85 SOL
+        const estimatedMarketCapSol = (pumpToken.bondingCurveProgress / 100) * 85;
+        pricePerToken = estimatedMarketCapSol / PUMP_TOTAL_SUPPLY;
+        logger.warn(`📝 [PAPER] Using bonding curve estimate: ${pricePerToken.toExponential(4)} SOL/token (${pumpToken.bondingCurveProgress.toFixed(1)}% progress)`);
+      }
+      // Absolute fallback - should never happen
+      else {
+        pricePerToken = 1e-8; // ~$0.000001 at $100 SOL
+        logger.error(`📝 [PAPER] No valid price data! Using fallback: ${pricePerToken.toExponential(4)} SOL/token`);
+      }
+      
+      tokenAmount = (solAmount / pricePerToken) * (1 - SLIPPAGE.BUY_SLIPPAGE_PERCENT / 100);
+      logger.info(`📝 [PAPER] Buy (estimated): ${solAmount} SOL → ${tokenAmount.toFixed(2)} tokens @ ${pricePerToken.toExponential(4)} SOL`);
+    }
   } else {
     // Jupiter/DEX
     platform = 'jupiter';
@@ -229,7 +279,7 @@ export async function paperBuy(
   
   logger.success(`📝 [PAPER] BUY executed:`);
   logger.info(`   ${solAmount.toFixed(4)} SOL → ${tokenAmount.toFixed(2)} ${symbol}`);
-  logger.info(`   Price: ${pricePerToken.toFixed(10)} SOL`);
+  logger.info(`   Price: ${pricePerToken.toFixed(12)} SOL`);
   logger.info(`   Platform: ${platform}`);
   logger.info(`   Fees: ${estimatedFees.toFixed(6)} SOL`);
   logger.info(`   Balance: ${portfolio.currentBalanceSOL.toFixed(4)} SOL`);
@@ -258,6 +308,9 @@ export async function paperSell(
   
   logger.info(`📝 [PAPER] Simulating SELL: ${tokenAmount.toFixed(2)} ${symbol} (${percentToSell}%)`);
   
+  // Log entry details
+  logger.info(`📝 [PAPER] Entry: ${position.avgEntryPrice.toFixed(12)} SOL/token (cost basis: ${costBasisSold.toFixed(4)} SOL)`);
+  
   // Detect platform and get price
   const pumpToken = await fetchPumpFunToken(mint);
   const isPump = pumpToken && !pumpToken.isGraduated;
@@ -268,9 +321,52 @@ export async function paperSell(
   
   if (isPump && pumpToken) {
     platform = 'pump.fun';
-    const quote = calculatePumpFunSellQuote(pumpToken, tokenAmount);
-    solReceived = quote.solAmount * (1 - SLIPPAGE.SELL_SLIPPAGE_PERCENT / 100);
-    pricePerToken = pumpToken.priceSol;
+    
+    // Log current market data
+    logger.info(`📝 [PAPER] Current Market:`);
+    logger.info(`   Spot Price: ${pumpToken.priceSol.toFixed(12)} SOL/token`);
+    logger.info(`   Market Cap: $${pumpToken.marketCapUsd.toFixed(0)} (${pumpToken.marketCapSol.toFixed(2)} SOL)`);
+    logger.info(`   Reserves: ${pumpToken.virtualSolReserves.toFixed(4)} vSOL / ${pumpToken.virtualTokenReserves.toFixed(0)} vTokens`);
+    
+    // Check if reserves are valid for bonding curve calculation
+    const hasValidReserves = pumpToken.virtualSolReserves > 0.001 && pumpToken.virtualTokenReserves > 1000;
+    
+    if (hasValidReserves) {
+      const quote = calculatePumpFunSellQuote(pumpToken, tokenAmount);
+      logger.info(`📝 [PAPER] Sell Quote: ${tokenAmount.toFixed(2)} tokens → ${quote.solAmount.toFixed(6)} SOL (impact: ${quote.priceImpact.toFixed(2)}%)`);
+      solReceived = quote.solAmount * (1 - SLIPPAGE.SELL_SLIPPAGE_PERCENT / 100);
+      pricePerToken = tokenAmount > 0 ? quote.solAmount / tokenAmount : pumpToken.priceSol;
+    } else {
+      // Fallback: Reserves invalid, try multiple price sources
+      // Priority: 1) current spot price, 2) entry price, 3) market cap derived
+      const PUMP_TOTAL_SUPPLY = 1_000_000_000;
+      
+      // Try current spot price first (most accurate for current value)
+      if (pumpToken.priceSol > 1e-15) {
+        pricePerToken = pumpToken.priceSol;
+        logger.warn(`📝 [PAPER] Reserves invalid, using current spot price: ${pricePerToken.toExponential(4)} SOL/token`);
+      }
+      // Try entry price (guaranteed to exist for open position)
+      else if (position.avgEntryPrice > 1e-15) {
+        pricePerToken = position.avgEntryPrice;
+        logger.warn(`📝 [PAPER] Using entry price for sell: ${pricePerToken.toExponential(4)} SOL/token`);
+      }
+      // Try market cap derived
+      else if (pumpToken.marketCapSol > 0) {
+        pricePerToken = pumpToken.marketCapSol / PUMP_TOTAL_SUPPLY;
+        logger.warn(`📝 [PAPER] Using market cap derived price: ${pricePerToken.toExponential(4)} SOL/token`);
+      }
+      // Absolute fallback
+      else {
+        pricePerToken = 1e-8;
+        logger.error(`📝 [PAPER] No valid price data! Using fallback: ${pricePerToken.toExponential(4)} SOL/token`);
+      }
+      
+      solReceived = (tokenAmount * pricePerToken) * (1 - SLIPPAGE.SELL_SLIPPAGE_PERCENT / 100);
+      logger.info(`📝 [PAPER] Sell (estimated): ${tokenAmount.toFixed(2)} tokens × ${pricePerToken.toExponential(4)} SOL = ${solReceived.toFixed(6)} SOL`);
+    }
+    
+    logger.info(`📝 [PAPER] After ${SLIPPAGE.SELL_SLIPPAGE_PERCENT}% slippage: ${solReceived.toFixed(6)} SOL`);
   } else {
     platform = 'jupiter';
     const marketData = await fetchMarketData(mint);
@@ -278,13 +374,20 @@ export async function paperSell(
     solReceived = (tokenAmount * pricePerToken) * (1 - SLIPPAGE.SELL_SLIPPAGE_PERCENT / 100);
   }
   
-  // Simulate fees
+  // Simulate fees (optional for paper trading)
   const estimatedFees = FEES_EXECUTION.PRIORITY_FEE_SOL + FEES_EXECUTION.JITO_BRIBE_SOL + 0.000005;
-  solReceived -= estimatedFees;
+  const grossSolReceived = solReceived;
+  const feesApplied = PAPER_TRADING_SKIP_FEES ? 0 : estimatedFees;
+  solReceived = Math.max(0, solReceived - feesApplied);
+  if (!PAPER_TRADING_SKIP_FEES && solReceived === 0 && grossSolReceived > 0) {
+    logger.warn(`📝 [PAPER] Sell proceeds (${grossSolReceived.toFixed(6)} SOL) are below fees (${estimatedFees.toFixed(6)} SOL) - net set to 0`);
+  }
   
-  // Calculate P&L
-  const pnl = solReceived - costBasisSold;
-  const pnlPercent = (pnl / costBasisSold) * 100;
+  // Calculate P&L (gross vs net)
+  const grossPnl = grossSolReceived - costBasisSold;
+  const grossPnlPercent = (grossPnl / costBasisSold) * 100;
+  const netPnl = solReceived - costBasisSold;
+  const netPnlPercent = (netPnl / costBasisSold) * 100;
   
   // Create paper trade
   const trade: PaperTrade = {
@@ -297,12 +400,16 @@ export async function paperSell(
     solAmount: solReceived,
     tokenAmount,
     pricePerToken,
-    estimatedFees,
+    estimatedFees: feesApplied,
     slippageApplied: SLIPPAGE.SELL_SLIPPAGE_PERCENT,
     entryPrice: position.avgEntryPrice,
     exitPrice: pricePerToken,
-    pnl,
-    pnlPercent,
+    pnl: netPnl,
+    pnlPercent: netPnlPercent,
+    grossPnl,
+    grossPnlPercent,
+    netPnl,
+    netPnlPercent,
     checklistPassed: [],
     status: 'closed',
     closeReason: reason,
@@ -310,9 +417,9 @@ export async function paperSell(
   
   // Update portfolio
   portfolio.currentBalanceSOL += solReceived;
-  portfolio.totalPnL += pnl;
+  portfolio.totalPnL += netPnl;
   
-  if (pnl > 0) {
+  if (netPnl > 0) {
     portfolio.wins++;
   } else {
     portfolio.losses++;
@@ -332,10 +439,16 @@ export async function paperSell(
   paperTrades.push(trade);
   savePaperTrades();
   
-  const pnlEmoji = pnl >= 0 ? '📈' : '📉';
+  const pnlEmoji = netPnl >= 0 ? '📈' : '📉';
   logger.success(`📝 [PAPER] SELL executed:`);
-  logger.info(`   ${tokenAmount.toFixed(2)} ${symbol} → ${solReceived.toFixed(4)} SOL`);
-  logger.info(`   ${pnlEmoji} P&L: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} SOL (${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(1)}%)`);
+  logger.info(`   ${tokenAmount.toFixed(2)} ${symbol} → ${solReceived.toFixed(6)} SOL`);
+  logger.info(`   ${pnlEmoji} P&L (gross): ${grossPnl >= 0 ? '+' : ''}${grossPnl.toFixed(4)} SOL (${grossPnlPercent >= 0 ? '+' : ''}${grossPnlPercent.toFixed(1)}%)`);
+  logger.info(`   ${pnlEmoji} P&L (net): ${netPnl >= 0 ? '+' : ''}${netPnl.toFixed(4)} SOL (${netPnlPercent >= 0 ? '+' : ''}${netPnlPercent.toFixed(1)}%)`);
+  if (PAPER_TRADING_SKIP_FEES) {
+    logger.info(`   Fees skipped (paper trading)`);
+  } else {
+    logger.info(`   Fees: ${feesApplied.toFixed(6)} SOL`);
+  }
   logger.info(`   Reason: ${reason}`);
   logger.info(`   Balance: ${portfolio.currentBalanceSOL.toFixed(4)} SOL`);
   

@@ -284,10 +284,49 @@ function handleTrade(data: PumpPortalTrade): void {
   // Update token cache
   const existing = tokenCache.get(data.mint);
   if (existing) {
-    existing.virtualSolReserves = data.vSolInBondingCurve / LAMPORTS_PER_SOL;
-    existing.virtualTokenReserves = data.vTokensInBondingCurve / 1e6;
-    existing.marketCapSol = data.marketCapSol / LAMPORTS_PER_SOL;
-    existing.priceSol = existing.virtualSolReserves / existing.virtualTokenReserves;
+    // Smart unit conversion for reserves
+    // WebSocket can return values in lamports OR already converted
+    // Heuristic: if value > 1e9, it's likely in lamports; if < 1000, it's likely in SOL/tokens
+    if (data.vSolInBondingCurve > 0) {
+      const rawSol = data.vSolInBondingCurve;
+      // Expected range for bonding curve: 1-100 SOL
+      // If > 1e9, definitely lamports. If < 1000, check if conversion makes sense
+      const convertedSol = rawSol > 1e9 ? rawSol / LAMPORTS_PER_SOL : 
+                           rawSol > 1000 ? rawSol / LAMPORTS_PER_SOL : rawSol;
+      // Sanity check: should be between 0.1 and 100 SOL for active bonding curve
+      if (convertedSol >= 0.1 && convertedSol <= 100) {
+        existing.virtualSolReserves = convertedSol;
+      }
+      // else: don't update, keep existing value
+    }
+    
+    if (data.vTokensInBondingCurve > 0) {
+      const rawTokens = data.vTokensInBondingCurve;
+      // Expected range: 100M - 1B tokens
+      // If > 1e12, definitely in token atoms (need /1e6). If < 1e9, check if makes sense
+      const convertedTokens = rawTokens > 1e12 ? rawTokens / 1e6 :
+                              rawTokens > 1e9 ? rawTokens / 1e6 : rawTokens;
+      // Sanity check: should be between 100M and 1B for pump.fun
+      if (convertedTokens >= 1e8 && convertedTokens <= 1.1e9) {
+        existing.virtualTokenReserves = convertedTokens;
+      }
+    }
+    
+    // Only update market cap if we have valid data (> 0)
+    if (data.marketCapSol > 0) {
+      const rawMcap = data.marketCapSol;
+      // Expected range: 1-100 SOL market cap during bonding curve
+      const convertedMcap = rawMcap > 1e9 ? rawMcap / LAMPORTS_PER_SOL : rawMcap;
+      if (convertedMcap >= 0.1 && convertedMcap <= 500) {
+        existing.marketCapSol = convertedMcap;
+        existing.marketCapUsd = existing.marketCapSol * (cachedSolPrice?.price || 150);
+      }
+    }
+    
+    // Recalculate price if we have valid reserves
+    if (existing.virtualSolReserves > 0.1 && existing.virtualTokenReserves > 1e8) {
+      existing.priceSol = existing.virtualSolReserves / existing.virtualTokenReserves;
+    }
     existing.tradeCount++;
     existing.lastTradeTimestamp = data.timestamp;
     existing.ageMinutes = (Date.now() - existing.createdTimestamp) / 1000 / 60;
@@ -579,10 +618,67 @@ async function convertApiResponseToToken(data: PumpFunApiResponse): Promise<Pump
   
   // Calculate derived values
   // Note: For graduated tokens, reserves may be 0 as liquidity moved to Raydium
-  const virtualSolReserves = (data.virtual_sol_reserves || 0) / LAMPORTS_PER_SOL;
-  const virtualTokenReserves = (data.virtual_token_reserves || 1) / 1e6; // Avoid divide by zero
-  const realSolReserves = (data.real_sol_reserves || 0) / LAMPORTS_PER_SOL;
-  const priceSol = data.price_sol || (virtualTokenReserves > 0 ? virtualSolReserves / virtualTokenReserves : 0);
+  const rawVirtualSol = data.virtual_sol_reserves || 0;
+  const rawVirtualTokens = data.virtual_token_reserves || 0;
+  const rawRealSol = data.real_sol_reserves || 0;
+
+  // Smart unit conversion with sanity checks
+  // API can return values in lamports/atoms OR already converted to SOL/tokens
+  // Expected ranges for pump.fun bonding curve:
+  // - virtualSolReserves: 10-100 SOL
+  // - virtualTokenReserves: 100M - 1B tokens
+  // - realSolReserves: 0-85 SOL
+  
+  let virtualSolReserves: number;
+  if (rawVirtualSol > 1e9) {
+    // Definitely in lamports (billions), convert to SOL
+    virtualSolReserves = rawVirtualSol / LAMPORTS_PER_SOL;
+  } else if (rawVirtualSol > 1000) {
+    // Ambiguous - could be lamports (thousands) or SOL (would be unusually high)
+    // Try conversion, check if result is reasonable
+    const asLamports = rawVirtualSol / LAMPORTS_PER_SOL;
+    virtualSolReserves = asLamports >= 0.1 ? asLamports : rawVirtualSol;
+  } else {
+    // Small value - assume already in SOL
+    virtualSolReserves = rawVirtualSol;
+  }
+  
+  let virtualTokenReserves: number;
+  if (rawVirtualTokens > 1e12) {
+    // Definitely in token atoms (trillions), convert
+    virtualTokenReserves = rawVirtualTokens / 1e6;
+  } else if (rawVirtualTokens > 1e9) {
+    // Billions - could be atoms or already converted
+    const asAtoms = rawVirtualTokens / 1e6;
+    // If result is in expected range (100M-1B), use it
+    virtualTokenReserves = asAtoms >= 1e8 ? asAtoms : rawVirtualTokens;
+  } else {
+    // Assume already in token units
+    virtualTokenReserves = rawVirtualTokens;
+  }
+  
+  let realSolReserves: number;
+  if (rawRealSol > 1e9) {
+    realSolReserves = rawRealSol / LAMPORTS_PER_SOL;
+  } else if (rawRealSol > 1000) {
+    const asLamports = rawRealSol / LAMPORTS_PER_SOL;
+    realSolReserves = asLamports >= 0.01 ? asLamports : rawRealSol;
+  } else {
+    realSolReserves = rawRealSol;
+  }
+
+  // Calculate price from API field or reserves
+  let priceSol = data.price_sol || 0;
+  if (priceSol === 0 && virtualTokenReserves > 0 && virtualSolReserves > 0) {
+    priceSol = virtualSolReserves / virtualTokenReserves;
+  }
+  
+  // Sanity check: price should be between 1e-12 and 1e-6 for typical pump.fun tokens
+  // If calculated price is outside this range, something is wrong
+  if (priceSol > 0 && (priceSol < 1e-12 || priceSol > 1e-5)) {
+    logger.debug(`Price sanity check failed: ${priceSol.toExponential(4)} - may have unit conversion issue`);
+  }
+  
   const priceUsd = data.price_usd || (data.price ? data.price : priceSol * solPrice);
   
   // For graduated tokens, bonding curve is 100%
@@ -618,7 +714,9 @@ async function convertApiResponseToToken(data: PumpFunApiResponse): Promise<Pump
 
   if (marketCapUsd === 0 && marketCapSol === 0 && virtualSolReserves > 0) {
     // Total supply is typically 1 billion for pump.fun tokens
-    const totalSupply = (data.total_supply || 1e9 * 1e6) / 1e6;
+    const rawSupply = data.total_supply || 0;
+    const totalSupply =
+      rawSupply > 1e9 ? rawSupply / 1e6 : rawSupply > 0 ? rawSupply : 1e9;
     marketCapSol = priceSol * totalSupply;
     marketCapUsd = marketCapSol * solPrice;
   }
@@ -630,8 +728,15 @@ async function convertApiResponseToToken(data: PumpFunApiResponse): Promise<Pump
   }
   
   // Logging for troubleshooting (visible level)
-  if (ageMinutes < 1 || marketCapUsd === 0) {
-    logger.warn(`API data check - ${data.symbol}: raw_timestamp=${data.created_timestamp}, converted_ts=${createdTimestamp}, age=${ageMinutes.toFixed(1)}min, raw_mcap=${rawMarketCap}, raw_usd_mcap=${data.usd_market_cap || data.market_cap_usd || 0}, price_sol=${priceSol.toFixed(6)}, price_usd=${priceUsd.toFixed(6)}, calculated_mcap=$${marketCapUsd.toFixed(0)}`);
+  if (ageMinutes < 1 || marketCapUsd === 0 || priceSol === 0) {
+    logger.warn(
+      `API data check - ${data.symbol}: raw_timestamp=${data.created_timestamp}, ` +
+      `raw_virtual_sol=${rawVirtualSol}, raw_virtual_tokens=${rawVirtualTokens}, ` +
+      `virtual_sol=${virtualSolReserves}, virtual_tokens=${virtualTokenReserves}, ` +
+      `price_sol=${priceSol.toFixed(12)}, price_usd=${priceUsd.toFixed(8)}, ` +
+      `raw_mcap=${rawMarketCap}, raw_usd_mcap=${data.usd_market_cap || data.market_cap_usd || 0}, ` +
+      `calculated_mcap=$${marketCapUsd.toFixed(0)}`
+    );
   }
   
   return {
@@ -690,8 +795,15 @@ async function fetchTokenViaRestApi(mint: string): Promise<PumpPortalToken | nul
     
     // Handle 304 Not Modified - return cached data
     if (response.status === 304 && cached) {
-      logger.debug(`REST API cache hit (304) for ${mint.slice(0, 8)}...`);
-      return convertApiResponseToToken(cached.data);
+      const cachedToken = await convertApiResponseToToken(cached.data);
+      // If cached conversion has no market cap, force a fresh fetch
+      if (cachedToken.marketCapUsd <= 0 && cachedToken.marketCapSol <= 0) {
+        logger.debug(`REST API 304 but cached token has no market cap, forcing fresh fetch...`);
+        etagCache.delete(cacheKey); // Clear stale ETag
+        return fetchTokenViaRestApi(mint); // Retry without ETag
+      }
+      logger.debug(`REST API cache hit (304) for ${mint.slice(0, 8)}... mcap: $${cachedToken.marketCapUsd.toFixed(0)}`);
+      return cachedToken;
     }
     
     if (!response.ok) {
@@ -747,8 +859,21 @@ export async function fetchTokenViaPumpPortal(
   // 2. Try REST API first (works for any token, even inactive ones)
   const restToken = await fetchTokenViaRestApi(mint);
   if (restToken) {
-    tokenCache.set(mint, restToken);
-    return restToken;
+    // Only update cache if the new token has market cap, or there's no existing cached token
+    const existingCached = tokenCache.get(mint);
+    if (!existingCached || 
+        restToken.marketCapUsd > 0 || 
+        restToken.marketCapSol > 0 ||
+        (existingCached.marketCapUsd <= 0 && existingCached.marketCapSol <= 0)) {
+      tokenCache.set(mint, restToken);
+    } else if (existingCached) {
+      // Merge: update other fields but keep the good market cap
+      logger.debug(`Preserving cached market cap: $${existingCached.marketCapUsd.toFixed(0)}`);
+      restToken.marketCapUsd = existingCached.marketCapUsd;
+      restToken.marketCapSol = existingCached.marketCapSol;
+      tokenCache.set(mint, restToken);
+    }
+    return tokenCache.get(mint)!;
   }
   
   // 3. Fallback to WebSocket (for very new tokens not yet indexed by REST API)

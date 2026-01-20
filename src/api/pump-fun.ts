@@ -163,12 +163,16 @@ export async function fetchPumpFunToken(mintAddress: string): Promise<PumpFunTok
       realSolReserves: portalToken.realSolReserves,
       realTokenReserves: 0,
       
-      priceUsd: portalToken.priceSol * solPriceUsd,
+      // Use existing USD values if available, otherwise calculate from SOL values
+      priceUsd: portalToken.priceUsd > 0 ? portalToken.priceUsd : portalToken.priceSol * solPriceUsd,
       priceSol: portalToken.priceSol,
-      marketCapUsd: portalToken.marketCapSol * solPriceUsd,
+      marketCapUsd: portalToken.marketCapUsd > 0 ? portalToken.marketCapUsd : portalToken.marketCapSol * solPriceUsd,
       marketCapSol: portalToken.marketCapSol,
       
-      bondingCurveProgress: Math.min(100, (portalToken.realSolReserves / BONDING_CURVE_SOL_TARGET) * 100),
+      // Use bondingCurveProgress from portal if available, otherwise calculate
+      bondingCurveProgress: portalToken.bondingCurveProgress > 0 
+        ? portalToken.bondingCurveProgress 
+        : Math.min(100, (portalToken.realSolReserves / BONDING_CURVE_SOL_TARGET) * 100),
       isGraduated: portalToken.isGraduated,
       
       website: portalToken.website,
