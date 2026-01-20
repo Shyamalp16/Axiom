@@ -4,7 +4,7 @@ A battle-tested trading bot for Solana memecoins with **hard-coded discipline ru
 
 **Supports both:**
 - 🟢 **Pump.fun** - Bonding curve tokens (pre-graduation)
-- 🔵 **Raydium/Orca** - DEX liquidity pool tokens (post-graduation)
+- 🔵 **DEX** - Raydium, BAGS, Meteora AMM, Meteora AMM V2, Pump AMM (post-graduation)
 
 ## Philosophy
 
@@ -22,7 +22,7 @@ This bot enforces discipline through code. No overrides. No "it looks good anywa
    - ❌ Freeze authority must be DISABLED
    - ❌ Transfer tax must be 0%
    - ❌ No blacklist/whitelist logic
-   - ✅ LP on Raydium or Orca
+   - ✅ LP on supported DEX (Raydium, BAGS, Meteora, Meteora V2, Pump AMM)
    - ✅ LP ≥ 30 SOL (floor: 25 SOL)
 
 2. **Wallet Distribution**
@@ -171,7 +171,7 @@ src/
 │   ├── data-providers.ts # Birdeye/Helius APIs
 │   └── pump-fun.ts       # Pump.fun bonding curve API
 ├── checkers/
-│   ├── token-safety.ts   # Mint/freeze/LP checks (Raydium)
+│   ├── token-safety.ts   # Mint/freeze/LP checks (DEX)
 │   ├── pump-fun-safety.ts # Pump.fun specific checks
 │   ├── wallet-distribution.ts
 │   ├── age-context.ts

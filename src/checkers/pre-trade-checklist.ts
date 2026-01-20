@@ -8,7 +8,7 @@
  * 
  * Supports both:
  * - Pump.fun tokens (bonding curve, pre-graduation)
- * - Raydium/Orca tokens (standard DEX liquidity)
+ * - DEX tokens (Raydium, BAGS, Meteora, Meteora V2, Pump AMM)
  */
 
 import { checkTokenSafety } from './token-safety.js';
@@ -68,7 +68,7 @@ export async function runPreTradeChecklist(
   logger.header('PRE-TRADE CHECKLIST');
   logger.header('═══════════════════════════════════════');
   logger.info(`Token: ${mintAddress}`);
-  logger.info(`Platform: ${isPump ? '🟢 PUMP.FUN (Bonding Curve)' : '🔵 RAYDIUM/ORCA (DEX)'}`);
+  logger.info(`Platform: ${isPump ? '🟢 PUMP.FUN (Bonding Curve)' : '🔵 DEX (Raydium/BAGS/Meteora/Pump AMM)'}`);
   logger.info(`Time: ${new Date().toISOString()}`);
   logger.divider();
   
@@ -93,7 +93,7 @@ export async function runPreTradeChecklist(
     return await runPumpFunChecklist(mintAddress, passedChecks, failedChecks, details);
   }
   
-  // ========== RAYDIUM/ORCA PATH (Standard DEX) ==========
+  // ========== DEX PATH (Raydium/BAGS/Meteora/Pump AMM) ==========
   
   // 1. TOKEN SAFETY (MANDATORY)
   logger.info('\n[1/5] Checking Token Safety...');

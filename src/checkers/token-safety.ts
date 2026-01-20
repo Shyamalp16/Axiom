@@ -36,7 +36,7 @@ export async function checkTokenSafety(mintAddress: string): Promise<TokenSafety
   let freezeAuthorityDisabled = false;
   let transferTaxPercent = 0;
   let hasBlacklistWhitelist = false;
-  let lpPlatform: 'raydium' | 'orca' | 'pumpfun' | 'unknown' = 'unknown';
+  let lpPlatform: 'raydium' | 'bags' | 'meteora' | 'meteora_v2' | 'pump_amm' | 'pumpfun' | 'unknown' = 'unknown';
   let lpSolAmount = 0;
   
   try {
@@ -55,7 +55,7 @@ export async function checkTokenSafety(mintAddress: string): Promise<TokenSafety
       // Bonding curve liquidity
       lpPlatform = 'pumpfun';
       lpSolAmount = pumpToken?.realSolReserves || 0;
-      logger.checklist('LP on Raydium/Orca', true, 'Pump.fun (bonding curve)');
+      logger.checklist('LP on supported DEX', true, 'Pump.fun (bonding curve)');
       logger.checklist('Bonding curve liquidity', lpSolAmount > 0, `${lpSolAmount.toFixed(2)} SOL in curve`);
       
     } else if (isPumpFunGraduated) {
@@ -124,13 +124,13 @@ export async function checkTokenSafety(mintAddress: string): Promise<TokenSafety
       lpPlatform = lpInfo.platform;
       lpSolAmount = lpInfo.solAmount;
       
-      const validPlatform = TOKEN_SAFETY.VALID_LP_PLATFORMS.includes(lpPlatform as 'raydium' | 'orca');
+      const validPlatform = TOKEN_SAFETY.VALID_LP_PLATFORMS.includes(lpPlatform as 'raydium' | 'bags' | 'meteora' | 'meteora_v2' | 'pump_amm');
       if (!validPlatform && lpPlatform !== 'unknown') {
-        failures.push(`LP not on Raydium/Orca - found on ${lpPlatform}`);
+        failures.push(`LP not on supported DEX - found on ${lpPlatform}`);
       } else if (lpPlatform === 'unknown') {
         failures.push('Could not detect LP platform');
       }
-      logger.checklist('LP on Raydium/Orca', validPlatform, lpPlatform);
+      logger.checklist('LP on supported DEX', validPlatform, lpPlatform);
       
       // 6. Check LP Size
       const lpSufficient = lpSolAmount >= TOKEN_SAFETY.ABSOLUTE_FLOOR_LP_SOL;

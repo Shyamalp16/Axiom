@@ -11,7 +11,7 @@
  * 
  * Automatically routes:
  * - Pump.fun tokens → Bonding curve
- * - Graduated tokens → Jupiter (Raydium/Orca)
+ * - Graduated tokens → Jupiter (Raydium/BAGS/Meteora/Pump AMM)
  */
 
 import { 

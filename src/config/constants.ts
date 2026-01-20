@@ -15,7 +15,7 @@ export const TOKEN_SAFETY = {
   BLACKLIST_WHITELIST_MUST_BE_NONE: true,
   
   // LP Requirements
-  VALID_LP_PLATFORMS: ['raydium', 'orca'] as const,
+  VALID_LP_PLATFORMS: ['raydium', 'bags', 'meteora', 'meteora_v2', 'pump_amm'] as const,
   MIN_LP_SOL: 30,           // Ideal minimum
   ABSOLUTE_FLOOR_LP_SOL: 25, // Hard floor - below this = instant reject
 } as const;
