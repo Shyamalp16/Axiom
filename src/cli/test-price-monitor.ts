@@ -161,7 +161,13 @@ async function main() {
       
       // Determine trade type indicator
       const tradeType = trade.txType === 'buy' ? '🟢 BUY ' : '🔴 SELL';
-      const tradeSize = (trade.solAmount / LAMPORTS_PER_SOL).toFixed(4);
+      
+      // Smart unit conversion for solAmount (may be in lamports or already SOL)
+      let tradeSolAmount = trade.solAmount;
+      if (tradeSolAmount > 1e9) {
+        tradeSolAmount = tradeSolAmount / LAMPORTS_PER_SOL;
+      }
+      const tradeSize = tradeSolAmount.toFixed(4);
       
       // Format output
       const changeIndicator = priceChange >= 0 ? `+${priceChange.toFixed(2)}%` : `${priceChange.toFixed(2)}%`;
