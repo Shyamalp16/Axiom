@@ -23,7 +23,9 @@
     "test:price": "tsx src/cli/test-price-monitor.ts",
     "test:axiom": "tsx src/cli/test-axiom.ts",
     "axiom:auto": "cross-env PAPER_TRADE=true tsx src/cli/axiom-auto.ts",
-    "axiom:status": "tsx src/cli/axiom-auto.ts status"
+    "axiom:status": "tsx src/cli/axiom-auto.ts status",
+    "ui": "tsx src/server/index.ts",
+    "ui:build": "tsc && node dist/server/index.js"
   },
   "keywords": [
     "solana",
@@ -41,6 +43,7 @@
     "cli-table3": "^0.6.5",
     "date-fns": "^3.6.0",
     "dotenv": "^16.4.5",
+    "express": "^4.22.1",
     "inquirer": "^9.2.23",
     "lowdb": "^7.0.1",
     "node-fetch": "^3.3.2",
@@ -48,6 +51,7 @@
     "ws": "^8.17.0"
   },
   "devDependencies": {
+    "@types/express": "^4.17.25",
     "@types/inquirer": "^9.0.7",
     "@types/node": "^20.14.0",
     "@types/ws": "^8.5.10",

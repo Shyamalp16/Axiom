@@ -15,8 +15,58 @@ import { join } from 'path';
 import { format } from 'date-fns';
 import { fetchPumpFunToken, calculatePumpFunBuyQuote, calculatePumpFunSellQuote } from '../api/pump-fun.js';
 import { fetchMarketData, fetchSolPrice } from '../api/data-providers.js';
+import { getAxiomBatchPrices, isAxiomAuthenticated } from '../api/axiom-trade.js';
 import { SLIPPAGE, FEES_EXECUTION, POSITION_SIZING } from '../config/index.js';
 import logger from '../utils/logger.js';
+
+// Cached SOL price for USD→SOL conversion
+let cachedSolPriceUsd = 200;
+let solPriceCacheTime = 0;
+
+async function getCachedSolPriceUsd(): Promise<number> {
+  // Cache for 60 seconds
+  if (Date.now() - solPriceCacheTime < 60000) {
+    return cachedSolPriceUsd;
+  }
+  try {
+    const price = await fetchSolPrice();
+    if (price > 0) {
+      cachedSolPriceUsd = price;
+      solPriceCacheTime = Date.now();
+    }
+  } catch {
+    // Use cached value
+  }
+  return cachedSolPriceUsd;
+}
+
+/**
+ * Fetch price from Axiom (for graduated/DEX tokens) with DexScreener fallback
+ */
+async function fetchAxiomPrice(mint: string): Promise<{ priceSol: number; source: string }> {
+  // Try Axiom first if authenticated
+  if (isAxiomAuthenticated()) {
+    try {
+      const axiomPrices = await getAxiomBatchPrices([mint]);
+      const priceData = axiomPrices[mint];
+      if (priceData && priceData.price > 0) {
+        const solPrice = await getCachedSolPriceUsd();
+        const priceSol = priceData.price / solPrice;
+        logger.debug(`📝 [PAPER] Axiom price for ${mint.slice(0, 8)}...: $${priceData.price} → ${priceSol.toExponential(4)} SOL`);
+        return { priceSol, source: 'axiom' };
+      } else {
+        logger.debug(`📝 [PAPER] Axiom batch-prices empty for ${mint.slice(0, 8)}...`);
+      }
+    } catch (err) {
+      logger.debug(`📝 [PAPER] Axiom batch-prices failed: ${err}`);
+    }
+  }
+  
+  // Fallback to DexScreener
+  const marketData = await fetchMarketData(mint);
+  logger.debug(`📝 [PAPER] DexScreener price for ${mint.slice(0, 8)}...: ${marketData.priceSol.toExponential(4)} SOL`);
+  return { priceSol: marketData.priceSol, source: 'dexscreener' };
+}
 
 const DATA_DIR = './data';
 const PAPER_TRADES_FILE = join(DATA_DIR, 'paper_trades.json');
@@ -226,11 +276,12 @@ export async function paperBuy(
       logger.info(`📝 [PAPER] Buy (estimated): ${solAmount} SOL → ${tokenAmount.toFixed(2)} tokens @ ${pricePerToken.toExponential(4)} SOL`);
     }
   } else {
-    // Jupiter/DEX
+    // Jupiter/DEX - use Axiom pricing for consistency
     platform = 'jupiter';
-    const marketData = await fetchMarketData(mint);
-    pricePerToken = marketData.priceSol;
+    const { priceSol, source } = await fetchAxiomPrice(mint);
+    pricePerToken = priceSol;
     tokenAmount = (solAmount / pricePerToken) * (1 - buySlippage / 100);
+    logger.debug(`📝 [PAPER] BUY price source: ${source}`);
   }
   
   // Simulate fees
@@ -375,10 +426,12 @@ export async function paperSell(
     
     logger.info(`📝 [PAPER] After ${sellSlippage}% slippage: ${solReceived.toFixed(6)} SOL`);
   } else {
+    // Jupiter/DEX - use Axiom pricing for consistency
     platform = 'jupiter';
-    const marketData = await fetchMarketData(mint);
-    pricePerToken = marketData.priceSol;
+    const { priceSol, source } = await fetchAxiomPrice(mint);
+    pricePerToken = priceSol;
     solReceived = (tokenAmount * pricePerToken) * (1 - sellSlippage / 100);
+    logger.debug(`📝 [PAPER] SELL price source: ${source}`);
   }
   
   // Simulate fees (optional for paper trading)

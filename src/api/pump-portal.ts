@@ -472,6 +472,18 @@ export function getCachedToken(mint: string): PumpPortalToken | null {
 }
 
 /**
+ * Fetch fresh token data (bypasses all caching)
+ * Use this for live price monitoring
+ */
+export async function fetchFreshPumpToken(mint: string): Promise<PumpPortalToken | null> {
+  const token = await fetchTokenViaRestApi(mint, true);
+  if (token) {
+    tokenCache.set(mint, token);
+  }
+  return token;
+}
+
+/**
  * Get recent trades from cache
  */
 export function getCachedTrades(mint: string): PumpPortalTrade[] {
@@ -739,12 +751,12 @@ async function convertApiResponseToToken(data: PumpFunApiResponse): Promise<Pump
  * Uses ?sync=true to get fresh on-chain data
  * Supports ETag caching for bandwidth optimization (304 Not Modified)
  */
-async function fetchTokenViaRestApi(mint: string): Promise<PumpPortalToken | null> {
+async function fetchTokenViaRestApi(mint: string, skipEtagCache: boolean = false): Promise<PumpPortalToken | null> {
   const cacheKey = `coins:${mint}`;
   const url = `${PUMPFUN_API_URL}/coins/${mint}?sync=true`;
   
   try {
-    logger.debug(`Fetching token via REST API: ${mint.slice(0, 8)}...`);
+    logger.debug(`Fetching token via REST API: ${mint.slice(0, 8)}...${skipEtagCache ? ' (fresh)' : ''}`);
     
     // Build headers with ETag support
     const headers: Record<string, string> = {
@@ -752,9 +764,9 @@ async function fetchTokenViaRestApi(mint: string): Promise<PumpPortalToken | nul
       'Origin': 'https://pump.fun',
     };
     
-    // Include If-None-Match header if we have a cached ETag
+    // Include If-None-Match header if we have a cached ETag (unless skipEtagCache)
     const cached = etagCache.get(cacheKey) as ETagCacheEntry<PumpFunApiResponse> | undefined;
-    if (cached && Date.now() - cached.timestamp < ETAG_CACHE_TTL_MS) {
+    if (!skipEtagCache && cached && Date.now() - cached.timestamp < ETAG_CACHE_TTL_MS) {
       headers['If-None-Match'] = cached.etag;
     }
     

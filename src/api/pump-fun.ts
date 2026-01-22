@@ -21,6 +21,7 @@ import {
   getCachedToken,
   getCachedTrades,
   fetchTokenViaPumpPortal,
+  fetchFreshPumpToken,
   waitForNewTokens,
   isConnectedToPumpPortal,
   fetchPumpFunRecentTrades as fetchTradesViaRest,
@@ -189,6 +190,72 @@ export async function fetchPumpFunToken(mintAddress: string, forceRefresh: boole
     
   } catch (error) {
     logger.debug(`Pump.fun fetch failed: ${error}`);
+    return null;
+  }
+}
+
+/**
+ * Fetch LIVE token data from Pump.fun (bypasses all caching)
+ * Use this for position monitoring where fresh data is critical
+ * @param mintAddress - Token mint address
+ */
+export async function fetchPumpFunTokenLive(mintAddress: string): Promise<PumpFunToken | null> {
+  try {
+    // Ensure connected
+    if (!isConnectedToPumpPortal()) {
+      await connectPumpPortal();
+    }
+    
+    // Force fresh fetch (bypasses ETag cache)
+    const portalToken = await fetchFreshPumpToken(mintAddress);
+    
+    if (!portalToken) {
+      return null;
+    }
+    
+    // Get SOL price for USD calculations
+    const solPriceUsd = await getSolPriceUsd();
+    
+    // Convert to PumpFunToken format
+    const token: PumpFunToken = {
+      mint: portalToken.mint,
+      name: portalToken.name,
+      symbol: portalToken.symbol,
+      description: portalToken.description || '',
+      imageUri: portalToken.imageUri || '',
+      creator: portalToken.creator,
+      createdTimestamp: portalToken.createdTimestamp,
+      ageMinutes: portalToken.ageMinutes,
+      
+      bondingCurve: portalToken.bondingCurve || '',
+      associatedBondingCurve: '',
+      virtualSolReserves: portalToken.virtualSolReserves,
+      virtualTokenReserves: portalToken.virtualTokenReserves,
+      realSolReserves: portalToken.realSolReserves,
+      realTokenReserves: 0,
+      
+      priceUsd: portalToken.priceUsd > 0 ? portalToken.priceUsd : portalToken.priceSol * solPriceUsd,
+      priceSol: portalToken.priceSol,
+      marketCapUsd: portalToken.marketCapUsd > 0 ? portalToken.marketCapUsd : portalToken.marketCapSol * solPriceUsd,
+      marketCapSol: portalToken.marketCapSol,
+      
+      bondingCurveProgress: portalToken.bondingCurveProgress > 0 
+        ? portalToken.bondingCurveProgress 
+        : Math.min(100, (portalToken.realSolReserves / BONDING_CURVE_SOL_TARGET) * 100),
+      isGraduated: portalToken.isGraduated,
+      
+      website: portalToken.website,
+      twitter: portalToken.twitter,
+      telegram: portalToken.telegram,
+      
+      replyCount: portalToken.tradeCount,
+      lastReply: portalToken.lastTradeTimestamp,
+    };
+    
+    return token;
+    
+  } catch (error) {
+    logger.debug(`Pump.fun live fetch failed: ${error}`);
     return null;
   }
 }

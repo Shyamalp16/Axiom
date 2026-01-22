@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Axiom UI</title>
+    <link rel="stylesheet" href="/styles.css?v=2" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark">AX</div>
+          <div>
+            <div class="brand-title">Axiom Trading</div>
+            <div class="brand-subtitle">High-contrast positions dashboard</div>
+          </div>
+        </div>
+        <nav class="tabs">
+          <button class="tab active" data-tab="positions">Positions</button>
+          <button class="tab" data-tab="stats">Stats</button>
+          <button class="tab" data-tab="control">Control</button>
+        </nav>
+      </header>
+
+      <main class="content">
+        <section id="positions" class="panel active">
+          <div class="panel-header">
+            <div>
+              <h2>Current Positions</h2>
+              <p class="muted">Click a position for details and price action.</p>
+            </div>
+            <div class="panel-actions">
+              <div class="filter-group">
+                <button class="filter-btn active" data-filter="all">All</button>
+                <button class="filter-btn" data-filter="live">Live</button>
+                <button class="filter-btn" data-filter="paper">Paper</button>
+                <button class="filter-btn" data-filter="axiom-auto">Axiom Auto</button>
+              </div>
+              <div class="status-pill" id="positionsStatus">Loading…</div>
+            </div>
+          </div>
+
+          <div class="positions-layout">
+            <div class="positions-list" id="positionsList"></div>
+            <div class="position-detail" id="positionDetail">
+              <div class="empty-state">
+                <h3>No position selected</h3>
+                <p>Select a position to view price action, MC, and PnL.</p>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="stats" class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>Overall Stats</h2>
+              <p class="muted">Daily summary and performance patterns.</p>
+            </div>
+            <div class="status-pill" id="statsStatus">Loading…</div>
+          </div>
+
+          <div class="stats-grid" id="statsGrid"></div>
+          <div class="stats-detail" id="statsDetail"></div>
+        </section>
+
+        <section id="control" class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>Bot Control</h2>
+              <p class="muted">Initialize, start, stop, and trigger actions.</p>
+            </div>
+            <div class="status-pill" id="controlStatus">Idle</div>
+          </div>
+
+          <div class="control-grid">
+            <div class="control-card" id="botStatusCard">
+              <h3>Bot Status</h3>
+              <div class="control-metrics" id="botStatusMetrics"></div>
+            </div>
+            <div class="control-card">
+              <h3>Bot Actions</h3>
+              <div class="button-row">
+                <button class="btn btn-primary" id="botInitBtn">Initialize</button>
+                <button class="btn btn-primary" id="botStartBtn">Start</button>
+                <button class="btn btn-secondary" id="botStopBtn">Stop</button>
+              </div>
+              <form class="control-form" id="checkTokenForm">
+                <label>Check Token</label>
+                <input type="text" id="checkTokenInput" placeholder="Mint address" />
+                <button class="btn btn-primary" type="submit">Run Checklist</button>
+              </form>
+              <form class="control-form" id="tradeTokenForm">
+                <label>Analyze & Trade</label>
+                <input type="text" id="tradeTokenInput" placeholder="Mint address" />
+                <button class="btn btn-primary" type="submit">Analyze & Trade</button>
+              </form>
+              <div class="control-output">
+                <label>Action Output</label>
+                <pre id="actionOutput">No actions yet.</pre>
+              </div>
+            </div>
+            <div class="control-card">
+              <h3>Paper Trading</h3>
+              <div class="control-metrics" id="paperStatusMetrics"></div>
+              <form class="control-form" id="paperResetForm">
+                <label>Reset Portfolio</label>
+                <input type="number" id="paperResetInput" min="0" step="0.1" value="2" />
+                <button class="btn btn-secondary" type="submit">Reset Paper</button>
+              </form>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/app.js?v=2" defer></script>
+  </body>
+</html>

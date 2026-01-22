@@ -242,44 +242,71 @@ async function getAccessToken(): Promise<string> {
 
 /**
  * Refresh the access token using refresh token
+ * Includes retry logic with exponential backoff for transient errors
  */
 async function refreshAccessToken(): Promise<void> {
   if (!refreshToken) {
     throw new Error('No refresh token available');
   }
   
-  const server = getRandomApiServer();
+  const maxRetries = 3;
+  const transientErrors = [502, 503, 504, 429];
+  let lastError: Error | null = null;
   
-  try {
-    const response = await fetch(`${server}/refresh-access-token`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Cookie': `auth-refresh-token=${refreshToken}`,
-        'Origin': 'https://axiom.trade',
-      },
-    });
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    // Try a different server on each retry
+    const server = AXIOM_API_SERVERS[(currentServerIndex + attempt) % AXIOM_API_SERVERS.length];
     
-    if (!response.ok) {
-      throw new Error(`Token refresh failed: ${response.status}`);
-    }
-    
-    const data = await response.json() as { access_token: string };
-    accessToken = data.access_token;
-    
-    // Parse new expiry
     try {
-      const payload = JSON.parse(Buffer.from(accessToken.split('.')[1], 'base64').toString());
-      tokenExpiresAt = payload.exp * 1000;
-    } catch {
-      tokenExpiresAt = Date.now() + 15 * 60 * 1000;
+      const response = await fetch(`${server}/refresh-access-token`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Cookie': `auth-refresh-token=${refreshToken}`,
+          'Origin': 'https://axiom.trade',
+        },
+      });
+      
+      if (!response.ok) {
+        // Check if this is a transient error worth retrying
+        if (transientErrors.includes(response.status) && attempt < maxRetries - 1) {
+          const delay = Math.pow(2, attempt) * 1000; // 1s, 2s, 4s
+          logger.warn(`Token refresh got ${response.status} from ${server}, retrying in ${delay}ms... (attempt ${attempt + 1}/${maxRetries})`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          continue;
+        }
+        throw new Error(`Token refresh failed: ${response.status}`);
+      }
+      
+      const data = await response.json() as { access_token: string };
+      accessToken = data.access_token;
+      
+      // Parse new expiry
+      try {
+        const payload = JSON.parse(Buffer.from(accessToken.split('.')[1], 'base64').toString());
+        tokenExpiresAt = payload.exp * 1000;
+      } catch {
+        tokenExpiresAt = Date.now() + 15 * 60 * 1000;
+      }
+      
+      logger.debug(`Axiom access token refreshed via ${server}`);
+      return; // Success!
+      
+    } catch (error) {
+      lastError = error as Error;
+      
+      // Only retry on network errors, not on auth failures
+      if (attempt < maxRetries - 1 && !(error instanceof Error && error.message.includes('Token refresh failed: 4'))) {
+        const delay = Math.pow(2, attempt) * 1000;
+        logger.warn(`Token refresh error from ${server}, retrying in ${delay}ms... (attempt ${attempt + 1}/${maxRetries})`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
     }
-    
-    logger.debug('Axiom access token refreshed');
-  } catch (error) {
-    logger.error('Failed to refresh Axiom token:', error);
-    throw error;
   }
+  
+  logger.error('Failed to refresh Axiom token after all retries:', lastError);
+  throw lastError || new Error('Token refresh failed after all retries');
 }
 
 // ============================================
@@ -442,6 +469,120 @@ export async function getAxiomChart(
   }
   
   return response.json();
+}
+
+/**
+ * Get token data by pair address
+ * This queries the same data source as the Axiom UI
+ */
+export async function getAxiomTokenByPair(
+  pairAddress: string
+): Promise<AxiomTrendingToken | null> {
+  try {
+    const token = await getAccessToken();
+    
+    // Try pair-specific endpoint
+    const response = await fetch(`${AXIOM_PRIMARY_API}/pair/${pairAddress}`, {
+      headers: {
+        'Cookie': `auth-access-token=${token}`,
+        'Origin': 'https://axiom.trade',
+      },
+    });
+    
+    if (response.ok) {
+      return await response.json() as AxiomTrendingToken;
+    }
+    
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Get token data by mint address (searches trending data)
+ * Returns the token's live market data from Axiom
+ */
+export async function getAxiomTokenByMint(
+  mint: string,
+  timePeriod: '5m' | '1h' | '24h' = '5m'
+): Promise<AxiomTrendingToken | null> {
+  try {
+    const trending = await getAxiomTrending(timePeriod);
+    return trending.find(t => t.tokenAddress === mint) || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Get real-time token price from Axiom chart API
+ * Uses pair address for chart data (more reliable than mint)
+ * Tries 1s candles first for most granular data, falls back to 1m
+ */
+export async function getAxiomLivePrice(
+  pairAddress: string
+): Promise<{ priceSol: number; mcUsd: number } | null> {
+  if (!pairAddress) {
+    logger.debug('Axiom chart: no pair address provided');
+    return null;
+  }
+  
+  try {
+    const token = await getAccessToken();
+    logger.debug(`Axiom chart: fetching for pair ${pairAddress.slice(0, 8)}...`);
+    
+    // Try 1-minute candles (1s may not be supported)
+    let response = await fetch(`${AXIOM_PRIMARY_API}/chart/${pairAddress}?timeframe=1m`, {
+      headers: {
+        'Cookie': `auth-access-token=${token}`,
+        'Origin': 'https://axiom.trade',
+      },
+    });
+    
+    // Also try with /pair/ prefix if direct fails
+    if (!response.ok) {
+      logger.debug(`Axiom chart: direct failed (${response.status}), trying /pair/...`);
+      response = await fetch(`${AXIOM_PRIMARY_API}/pair/${pairAddress}/chart?timeframe=1m`, {
+        headers: {
+          'Cookie': `auth-access-token=${token}`,
+          'Origin': 'https://axiom.trade',
+        },
+      });
+    }
+    
+    if (!response.ok) {
+      logger.debug(`Axiom chart: all attempts failed (${response.status})`);
+      return null;
+    }
+    
+    const data = await response.json() as any;
+    
+    // Log raw data structure for debugging
+    logger.debug(`Axiom chart response: ${JSON.stringify(data).slice(0, 300)}...`);
+    
+    // Chart data is typically an array of candles [time, open, high, low, close, volume]
+    // Get the most recent candle's close price
+    if (Array.isArray(data) && data.length > 0) {
+      const lastCandle = data[data.length - 1];
+      // Format: [timestamp, open, high, low, close, volume] or similar
+      if (Array.isArray(lastCandle) && lastCandle.length >= 5) {
+        const closePriceSol = lastCandle[4]; // Close price
+        logger.debug(`Axiom chart: ${data.length} candles, last close=${closePriceSol}`);
+        return { priceSol: closePriceSol, mcUsd: 0 };
+      }
+      // Alternative format: { time, open, high, low, close, volume }
+      if (lastCandle.close !== undefined) {
+        logger.debug(`Axiom chart: ${data.length} candles, last close=${lastCandle.close}`);
+        return { priceSol: lastCandle.close, mcUsd: 0 };
+      }
+    }
+    
+    logger.debug(`Axiom chart: unexpected format`);
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -686,7 +827,9 @@ export async function connectAxiomWebSocket(
       
       axiomWs.on('message', (data: WebSocket.Data) => {
         try {
-          const message = JSON.parse(data.toString()) as AxiomWSMessage;
+          const rawMsg = data.toString();
+          logger.debug(`Axiom WS raw: ${rawMsg.slice(0, 200)}...`);
+          const message = JSON.parse(rawMsg) as AxiomWSMessage;
           handleAxiomWSMessage(message);
         } catch (error) {
           logger.debug(`Axiom WS parse error: ${error}`);
@@ -745,6 +888,7 @@ function handleAxiomWSMessage(message: AxiomWSMessage): void {
     case 'market_update':
     case 'price_update': {
       const update = message.data as AxiomPriceUpdate;
+      logger.debug(`Axiom WS price update: ${update.mint?.slice(0, 8)}... price=${update.price} mc=${update.marketCap}`);
       const handlers = priceHandlers.get(update.mint) || [];
       for (const handler of handlers) {
         try {
@@ -829,11 +973,20 @@ export function subscribeAxiomPrice(
   
   // Send subscription if first handler for this mint
   if (handlers.length === 1) {
-    axiomWs.send(JSON.stringify({
-      action: 'join',
-      room: mint,
-    }));
-    logger.debug(`Subscribed to Axiom price updates for ${mint.slice(0, 8)}...`);
+    // Try multiple room formats to see which one works
+    const roomFormats = [
+      mint,                    // Just mint
+      `token:${mint}`,         // token:mint
+      `pair:${mint}`,          // pair:mint  
+    ];
+    
+    for (const room of roomFormats) {
+      axiomWs.send(JSON.stringify({
+        action: 'join',
+        room,
+      }));
+      logger.debug(`Axiom WS: joined room '${room.slice(0, 20)}...'`);
+    }
   }
   
   // Return unsubscribe function

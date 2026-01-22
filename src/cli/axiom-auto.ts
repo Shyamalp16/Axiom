@@ -10,12 +10,21 @@
  */
 
 import 'dotenv/config';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { join } from 'path';
 import {
   loadAxiomAuthFromEnv,
   isAxiomAuthenticated,
   getAxiomTrending,
+  getAxiomBatchPrices,
+  getAxiomLivePrice,
+  getAxiomTokenByMint,
+  connectAxiomWebSocket,
+  subscribeAxiomPrice,
   AxiomTrendingToken,
+  AxiomPriceUpdate,
 } from '../api/axiom-trade.js';
+import { fetchPumpFunToken, fetchPumpFunTokenLive } from '../api/pump-fun.js';
 import { 
   paperBuy, 
   paperSell, 
@@ -53,9 +62,11 @@ const AXIOM_AUTO_CONFIG = {
   positionSizeSol: POSITION_SIZING.IDEAL_PER_TRADE_SOL,
   
   // Exit settings
-  takeProfitPercent: 20,           // 30% TP
-  stopLossPercent: -10,            // -15% SL
-  priceCheckIntervalMs: 500,      // Check price every 5 seconds
+  takeProfitPercent: 20,           // 20% TP
+  stopLossPercent: 8,              // 8% SL (absolute)
+  stagnantExitSeconds: 60,         // Auto-exit if no meaningful move (60s - DexScreener updates slowly)
+  stagnantMinMovePercent: 0.3,     // Min % move to reset stagnation timer (lowered for low-liquidity tokens)
+  priceCheckIntervalMs: 1000,      // Check price every 1 second (was 500ms, too fast for API)
 };
 
 // ============================================
@@ -70,7 +81,20 @@ interface BotState {
   tradesEntered: number;
   tradesRejected: number;
   lastTradeTime: number;
-  currentPosition: { mint: string; symbol: string; entryPrice: number; entryMcSol: number; platform: 'pump.fun' | 'jupiter' } | null;
+  currentPosition: {
+    mint: string;
+    pairAddress: string;  // For chart API
+    symbol: string;
+    entryPrice: number;
+    entryMcSol: number;
+    platform: 'pump.fun' | 'jupiter';
+    lastPriceSol: number;
+    lastMoveTime: number;
+    lastPnlPercent?: number;
+    lastMcUsd?: number;
+    estimatedPnlSol?: number;
+    costBasisSol?: number;
+  } | null;
   recentlyTraded: Set<string>;  // Tokens we've already traded (cooldown)
 }
 
@@ -88,6 +112,70 @@ let state: BotState = {
 
 let shutdownRequested = false;
 let manualExitRequested = false;
+
+// Real-time price from Axiom WebSocket
+let wsPrice: { priceSol: number; mcUsd: number; timestamp: number } | null = null;
+let wsPriceUnsubscribe: (() => void) | null = null;
+
+const DATA_DIR = './data';
+const STATUS_FILE = join(DATA_DIR, 'axiom_auto_status.json');
+const COMMAND_FILE = join(DATA_DIR, 'axiom_auto_command.json');
+
+if (!existsSync(DATA_DIR)) {
+  mkdirSync(DATA_DIR, { recursive: true });
+}
+
+function writeStatusFile(): void {
+  try {
+    const status = {
+      isRunning: state.isRunning,
+      startTime: state.startTime.toISOString(),
+      pollCount: state.pollCount,
+      tokensAnalyzed: state.tokensAnalyzed,
+      tradesEntered: state.tradesEntered,
+      tradesRejected: state.tradesRejected,
+      lastTradeTime: state.lastTradeTime,
+      currentPosition: state.currentPosition
+        ? {
+            mint: state.currentPosition.mint,
+            symbol: state.currentPosition.symbol,
+            entryPrice: state.currentPosition.entryPrice,
+            entryMcSol: state.currentPosition.entryMcSol,
+            platform: state.currentPosition.platform,
+            lastPriceSol: state.currentPosition.lastPriceSol,
+            lastPnlPercent: state.currentPosition.lastPnlPercent ?? null,
+            lastMcUsd: state.currentPosition.lastMcUsd ?? null,
+            estimatedPnlSol: state.currentPosition.estimatedPnlSol ?? null,
+            costBasisSol: state.currentPosition.costBasisSol ?? null,
+            lastMoveTime: state.currentPosition.lastMoveTime,
+          }
+        : null,
+      lastUpdated: new Date().toISOString(),
+    };
+    writeFileSync(STATUS_FILE, JSON.stringify(status, null, 2));
+  } catch {
+    // Ignore status write failures
+  }
+}
+
+function readCommandFile(): { action?: string; timestamp?: string } | null {
+  try {
+    if (!existsSync(COMMAND_FILE)) return null;
+    const raw = readFileSync(COMMAND_FILE, 'utf-8');
+    if (!raw) return null;
+    return JSON.parse(raw) as { action?: string; timestamp?: string };
+  } catch {
+    return null;
+  }
+}
+
+function clearCommandFile(): void {
+  try {
+    writeFileSync(COMMAND_FILE, JSON.stringify({ action: 'none', timestamp: new Date().toISOString() }, null, 2));
+  } catch {
+    // Ignore
+  }
+}
 
 // ============================================
 // MAIN FUNCTIONS
@@ -171,26 +259,53 @@ async function startBot(): Promise<void> {
       // Infer platform from mint address (pump.fun mints end with 'pump')
       const inferredPlatform = mint.toLowerCase().endsWith('pump') ? 'pump.fun' : 'jupiter';
       
-      // Fetch current MC to use as estimate (we don't have historical entry MC)
+      // Fetch current MC and pair address (we don't have historical entry MC)
       let estimatedEntryMcSol = 0;
+      let pairAddress = '';
+      
+      // First try Axiom trending for pair address
       try {
-        const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
-        if (response.ok) {
-          const data = await response.json() as any;
-          const pairs = data?.pairs || [];
-          if (pairs.length > 0) {
-            const topPair = pairs.sort((a: any, b: any) => 
-              (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0)
-            )[0];
-            const mcUsd = topPair.marketCap || topPair.fdv || 0;
-            estimatedEntryMcSol = mcUsd / 150; // Convert USD to SOL estimate
-          }
+        const trending = await getAxiomTrending(AXIOM_AUTO_CONFIG.timePeriod);
+        const token = trending.find(t => t.tokenAddress === mint);
+        if (token) {
+          pairAddress = token.pairAddress;
+          estimatedEntryMcSol = token.marketCapSol;
         }
       } catch {
-        // Use 0 if fetch fails
+        // Fall back to DexScreener
       }
       
-      state.currentPosition = { mint, symbol: pos.symbol, entryPrice: pos.avgEntryPrice, entryMcSol: estimatedEntryMcSol, platform: inferredPlatform as 'pump.fun' | 'jupiter' };
+      // Fall back to DexScreener if not in trending
+      if (!pairAddress) {
+        try {
+          const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
+          if (response.ok) {
+            const data = await response.json() as any;
+            const pairs = data?.pairs || [];
+            if (pairs.length > 0) {
+              const topPair = pairs.sort((a: any, b: any) => 
+                (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0)
+              )[0];
+              pairAddress = topPair.pairAddress || '';
+              const mcUsd = topPair.marketCap || topPair.fdv || 0;
+              estimatedEntryMcSol = mcUsd / 150; // Convert USD to SOL estimate
+            }
+          }
+        } catch {
+          // Use defaults if fetch fails
+        }
+      }
+      
+      state.currentPosition = {
+        mint,
+        pairAddress,
+        symbol: pos.symbol,
+        entryPrice: pos.avgEntryPrice,
+        entryMcSol: estimatedEntryMcSol,
+        platform: inferredPlatform as 'pump.fun' | 'jupiter',
+        lastPriceSol: pos.avgEntryPrice,
+        lastMoveTime: Date.now(),
+      };
       const mcDisplay = estimatedEntryMcSol > 0 ? `~$${(estimatedEntryMcSol * 150 / 1000).toFixed(0)}k MC` : 'MC unknown';
       logger.info(`📝 Existing position: ${pos.symbol} @ ${pos.avgEntryPrice.toExponential(4)} SOL (${inferredPlatform}, ${mcDisplay})`);
     }
@@ -211,6 +326,7 @@ async function startBot(): Promise<void> {
   // 6. Start main loop
   state.isRunning = true;
   state.startTime = new Date();
+  writeStatusFile();
   
   logger.success('Axiom auto-trader started');
   logger.info('Press Ctrl+C to stop gracefully\n');
@@ -224,6 +340,13 @@ async function startBot(): Promise<void> {
 async function mainLoop(): Promise<void> {
   while (state.isRunning && !shutdownRequested) {
     try {
+      const command = readCommandFile();
+      if (command?.action === 'exit' && state.currentPosition) {
+        logger.warn('🔴 Exit command received from UI');
+        manualExitRequested = true;
+        clearCommandFile();
+      }
+
       // If we have a position, monitor it
       if (state.currentPosition) {
         await monitorPosition();
@@ -231,6 +354,8 @@ async function mainLoop(): Promise<void> {
         // Look for new opportunities
         await discoverAndTrade();
       }
+
+      writeStatusFile();
       
       // Wait before next iteration
       await sleep(state.currentPosition ? AXIOM_AUTO_CONFIG.priceCheckIntervalMs : AXIOM_AUTO_CONFIG.pollIntervalMs);
@@ -483,11 +608,35 @@ async function enterTrade(token: AxiomTrendingToken, passedChecks: string[]): Pr
     // Track position for monitoring (use MC ratio for P&L consistency)
     state.currentPosition = {
       mint: token.tokenAddress,
+      pairAddress: token.pairAddress,  // For chart API
       symbol: token.tokenTicker,
       entryPrice: trade.pricePerToken,
       entryMcSol: token.marketCapSol,  // Store entry MC for ratio-based P&L
       platform: trade.platform,  // 'pump.fun' or 'jupiter'
+      lastPriceSol: trade.pricePerToken,
+      lastMoveTime: Date.now(),
     };
+
+    writeStatusFile();
+    
+    // Subscribe to real-time price updates via WebSocket
+    try {
+      await connectAxiomWebSocket();
+      wsPrice = null; // Reset
+      const solPriceAtEntry = await getSolPriceUsd(); // Cache SOL price for conversion
+      wsPriceUnsubscribe = subscribeAxiomPrice(token.tokenAddress, (update: AxiomPriceUpdate) => {
+        // WebSocket price is in USD, convert to SOL
+        const priceSol = solPriceAtEntry > 0 ? update.price / solPriceAtEntry : 0;
+        wsPrice = {
+          priceSol,
+          mcUsd: update.marketCap,
+          timestamp: update.timestamp || Date.now(),
+        };
+      });
+      logger.debug(`  Subscribed to real-time price updates for ${token.tokenTicker}`);
+    } catch (err) {
+      logger.debug(`  Could not subscribe to WebSocket: ${err}`);
+    }
     
     logger.success(`  Trade entered: ${trade.tokenAmount.toFixed(2)} ${token.tokenTicker} @ ${trade.pricePerToken.toExponential(4)} SOL`);
     
@@ -499,7 +648,7 @@ async function enterTrade(token: AxiomTrendingToken, passedChecks: string[]): Pr
 async function monitorPosition(): Promise<void> {
   if (!state.currentPosition) return;
   
-  const { mint, symbol, entryPrice, entryMcSol, platform } = state.currentPosition;
+  const { mint, pairAddress, symbol, entryPrice, entryMcSol, platform } = state.currentPosition;
   
   // Check for manual exit request first
   if (manualExitRequested) {
@@ -509,91 +658,243 @@ async function monitorPosition(): Promise<void> {
     return;
   }
   
+  // Helper to format price in readable units
+  const fmtPrice = (price: number): string => {
+    if (price >= 0.001) return `${price.toFixed(6)} SOL`;
+    if (price >= 0.000001) return `${(price * 1e6).toFixed(2)} μSOL`;
+    return `${(price * 1e9).toFixed(2)} nSOL`;
+  };
+  
   try {
-    // Fetch current data from Axiom
+    // PRIORITY 1: Check WebSocket price first (most real-time!)
+    if (wsPrice && wsPrice.priceSol > 0 && (Date.now() - wsPrice.timestamp) < 5000) {
+      const currentPriceSol = wsPrice.priceSol;
+      const currentMcUsd = wsPrice.mcUsd;
+      const source = 'axiom-ws';
+      
+      const pnlPercent = ((currentPriceSol - entryPrice) / entryPrice) * 100;
+      const emoji = pnlPercent >= 0 ? '📈' : '📉';
+      const portfolio = getPaperPortfolio();
+      const position = portfolio.positions.get(mint);
+      const estimatedPnlSol = position ? position.costBasis * (pnlPercent / 100) : null;
+      const pnlSolDisplay = estimatedPnlSol !== null
+        ? ` | ${estimatedPnlSol >= 0 ? '+' : ''}${estimatedPnlSol.toFixed(4)} SOL est`
+        : '';
+
+      if (state.currentPosition) {
+        const now = Date.now();
+        const lastPrice = state.currentPosition.lastPriceSol;
+        const movePercent = lastPrice > 0
+          ? Math.abs((currentPriceSol - lastPrice) / lastPrice) * 100
+          : 0;
+
+        if (movePercent >= AXIOM_AUTO_CONFIG.stagnantMinMovePercent) {
+          state.currentPosition.lastPriceSol = currentPriceSol;
+          state.currentPosition.lastMoveTime = now;
+        } else {
+          const stagnantMs = now - state.currentPosition.lastMoveTime;
+          if (stagnantMs >= AXIOM_AUTO_CONFIG.stagnantExitSeconds * 1000) {
+            logger.warn(`  ⏳ Position stagnant for ${(stagnantMs / 1000).toFixed(0)}s with no significant move (min ${AXIOM_AUTO_CONFIG.stagnantMinMovePercent}%)`);
+            await exitPosition('STAGNANT');
+            return;
+          }
+        }
+
+        state.currentPosition.lastPnlPercent = pnlPercent;
+        state.currentPosition.lastMcUsd = currentMcUsd;
+      }
+
+      const mcDisplay = currentMcUsd >= 1_000_000 
+        ? `$${(currentMcUsd / 1_000_000).toFixed(1)}M` 
+        : `$${(currentMcUsd / 1000).toFixed(1)}k`;
+      const sourceTag = ` [${source}]`;
+      
+      logger.info(`  ${emoji} ${symbol}: ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(1)}% (SOL)${pnlSolDisplay} | MC: ${mcDisplay} | ${fmtPrice(currentPriceSol)} (entry: ${fmtPrice(entryPrice)})${sourceTag}  [x to exit]`);
+      writeStatusFile();
+      
+      if (pnlPercent >= AXIOM_AUTO_CONFIG.takeProfitPercent) {
+        logger.success(`  🎯 Take profit hit! (+${pnlPercent.toFixed(1)}%)`);
+        await exitPosition('TP');
+      } else if (pnlPercent <= -AXIOM_AUTO_CONFIG.stopLossPercent) {
+        logger.warn(`  🛑 Stop loss hit! (${pnlPercent.toFixed(1)}%)`);
+        await exitPosition('SL');
+      }
+      return;
+    }
+    
+    // PRIORITY 2: Try DexScreener (most reliable free API)
+    try {
+      const dexResponse = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
+      if (dexResponse.ok) {
+        const dexData = await dexResponse.json() as any;
+        const pairs = dexData?.pairs || [];
+        if (pairs.length > 0) {
+          const topPair = pairs.sort((a: any, b: any) => 
+            (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0)
+          )[0];
+          const priceUsd = parseFloat(topPair.priceUsd || '0');
+          const solPriceUsd = await getSolPriceUsd();
+          const currentPriceSol = priceUsd / solPriceUsd;
+          const currentMcUsd = topPair.marketCap || topPair.fdv || 0;
+          
+          if (currentPriceSol > 0) {
+            const source = 'dexscreener';
+            const pnlPercent = ((currentPriceSol - entryPrice) / entryPrice) * 100;
+            const emoji = pnlPercent >= 0 ? '📈' : '📉';
+            const portfolio = getPaperPortfolio();
+            const position = portfolio.positions.get(mint);
+            const estimatedPnlSol = position ? position.costBasis * (pnlPercent / 100) : null;
+            const pnlSolDisplay = estimatedPnlSol !== null
+              ? ` | ${estimatedPnlSol >= 0 ? '+' : ''}${estimatedPnlSol.toFixed(4)} SOL est`
+              : '';
+
+            if (state.currentPosition) {
+              const now = Date.now();
+              const lastPrice = state.currentPosition.lastPriceSol;
+              const movePercent = lastPrice > 0
+                ? Math.abs((currentPriceSol - lastPrice) / lastPrice) * 100
+                : 0;
+
+              if (movePercent >= AXIOM_AUTO_CONFIG.stagnantMinMovePercent) {
+                state.currentPosition.lastPriceSol = currentPriceSol;
+                state.currentPosition.lastMoveTime = now;
+              } else {
+                const stagnantMs = now - state.currentPosition.lastMoveTime;
+                if (stagnantMs >= AXIOM_AUTO_CONFIG.stagnantExitSeconds * 1000) {
+                  logger.warn(`  ⏳ Position stagnant for ${(stagnantMs / 1000).toFixed(0)}s with no significant move`);
+                  await exitPosition('STAGNANT');
+                  return;
+                }
+              }
+
+              state.currentPosition.lastPnlPercent = pnlPercent;
+              state.currentPosition.lastMcUsd = currentMcUsd;
+            }
+
+            const mcDisplay = currentMcUsd >= 1_000_000 
+              ? `$${(currentMcUsd / 1_000_000).toFixed(1)}M` 
+              : `$${(currentMcUsd / 1000).toFixed(1)}k`;
+            const sourceTag = ` [${source}]`;
+            
+            logger.info(`  ${emoji} ${symbol}: ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(1)}% (SOL)${pnlSolDisplay} | MC: ${mcDisplay} | ${fmtPrice(currentPriceSol)} (entry: ${fmtPrice(entryPrice)})${sourceTag}  [x to exit]`);
+            writeStatusFile();
+            
+            if (pnlPercent >= AXIOM_AUTO_CONFIG.takeProfitPercent) {
+              logger.success(`  🎯 Take profit hit! (+${pnlPercent.toFixed(1)}%)`);
+              await exitPosition('TP');
+            } else if (pnlPercent <= -AXIOM_AUTO_CONFIG.stopLossPercent) {
+              logger.warn(`  🛑 Stop loss hit! (${pnlPercent.toFixed(1)}%)`);
+              await exitPosition('SL');
+            }
+            return;
+          }
+        }
+      }
+    } catch (err) {
+      logger.debug(`DexScreener failed: ${err}`);
+    }
+    
+    // PRIORITY 4: Fetch current data from Axiom trending (last resort, updates every ~20s)
     const trending = await getAxiomTrending(AXIOM_AUTO_CONFIG.timePeriod);
     const token = trending.find(t => t.tokenAddress === mint);
     
     if (!token) {
-      // Token not in trending - fetch live data directly from DexScreener
-      logger.debug(`  ${symbol} not in trending, using DexScreener...`);
-      
+      // Token not in trending - fetch live price
+      logger.debug(`  ${symbol} not in trending, fetching live price...`);
       try {
-        const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
-        if (response.ok) {
-          const data = await response.json() as any;
-          const pairs = data?.pairs || [];
-          if (pairs.length > 0) {
-            const topPair = pairs.sort((a: any, b: any) => 
-              (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0)
-            )[0];
-            const currentPriceSol = parseFloat(topPair.priceNative) || 0;
-            const currentMcUsd = topPair.marketCap || topPair.fdv || 0;
-            
-            if (currentPriceSol > 0) {
-              const pnlPercent = ((currentPriceSol - entryPrice) / entryPrice) * 100;
-              const emoji = pnlPercent >= 0 ? '📈' : '📉';
-              const portfolio = getPaperPortfolio();
-              const position = portfolio.positions.get(mint);
-              const estimatedPnlSol = position ? position.costBasis * (pnlPercent / 100) : null;
-              const pnlSolDisplay = estimatedPnlSol !== null
-                ? ` | ${estimatedPnlSol >= 0 ? '+' : ''}${estimatedPnlSol.toFixed(4)} SOL est`
-                : '';
-              
-              const formatPrice = (price: number): string => {
-                if (price >= 0.001) return `${price.toFixed(6)} SOL`;
-                if (price >= 0.000001) return `${(price * 1e6).toFixed(2)} μSOL`;
-                return `${(price * 1e9).toFixed(2)} nSOL`;
-              };
-              
-              const formatMc = (usd: number): string => {
-                if (usd >= 1_000_000) return `$${(usd / 1_000_000).toFixed(2)}M`;
-                if (usd >= 1_000) return `$${(usd / 1_000).toFixed(1)}k`;
-                return `$${usd.toFixed(0)}`;
-              };
-              const mcDisplay = currentMcUsd > 0 ? formatMc(currentMcUsd) : '?';
-              logger.info(`  ${emoji} ${symbol}: ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(1)}% (SOL)${pnlSolDisplay} | MC: ${mcDisplay} | ${formatPrice(currentPriceSol)} (entry: ${formatPrice(entryPrice)})  [x to exit]`);
-              
-              // Check TP/SL
-              if (pnlPercent >= AXIOM_AUTO_CONFIG.takeProfitPercent) {
-                logger.success(`  🎯 Take profit hit! (+${pnlPercent.toFixed(1)}%)`);
-                await exitPosition('TP');
-              } else if (pnlPercent <= AXIOM_AUTO_CONFIG.stopLossPercent) {
-                logger.warn(`  🛑 Stop loss hit! (${pnlPercent.toFixed(1)}%)`);
-                await exitPosition('SL');
-              }
+        const { priceSol: currentPriceSol, mcUsd: currentMcUsd, source } = await fetchCurrentPriceAndMc(
+          mint,
+          entryPrice,
+          platform
+        );
+        if (currentPriceSol > 0) {
+          const pnlPercent = ((currentPriceSol - entryPrice) / entryPrice) * 100;
+          const emoji = pnlPercent >= 0 ? '📈' : '📉';
+          const portfolio = getPaperPortfolio();
+          const position = portfolio.positions.get(mint);
+          const estimatedPnlSol = position ? position.costBasis * (pnlPercent / 100) : null;
+          const pnlSolDisplay = estimatedPnlSol !== null
+            ? ` | ${estimatedPnlSol >= 0 ? '+' : ''}${estimatedPnlSol.toFixed(4)} SOL est`
+            : '';
+          
+          if (state.currentPosition) {
+            state.currentPosition.lastPnlPercent = pnlPercent;
+            state.currentPosition.lastMcUsd = currentMcUsd;
+            state.currentPosition.estimatedPnlSol = estimatedPnlSol ?? undefined;
+            state.currentPosition.costBasisSol = position?.costBasis ?? undefined;
+          }
+
+          if (state.currentPosition) {
+            const now = Date.now();
+            const lastPrice = state.currentPosition.lastPriceSol;
+            const movePercent = lastPrice > 0
+              ? Math.abs((currentPriceSol - lastPrice) / lastPrice) * 100
+              : 0;
+            if (movePercent >= AXIOM_AUTO_CONFIG.stagnantMinMovePercent) {
+              state.currentPosition.lastPriceSol = currentPriceSol;
+              state.currentPosition.lastMoveTime = now;
+            } else if (now - state.currentPosition.lastMoveTime >= AXIOM_AUTO_CONFIG.stagnantExitSeconds * 1000) {
+              logger.warn(`  💤 No meaningful price action for ${AXIOM_AUTO_CONFIG.stagnantExitSeconds}s (${movePercent.toFixed(2)}% move). Closing position.`);
+              await exitPosition('STAGNANT');
               return;
             }
           }
+          
+          const formatPrice = (price: number): string => {
+            if (price >= 0.001) return `${price.toFixed(6)} SOL`;
+            if (price >= 0.000001) return `${(price * 1e6).toFixed(2)} μSOL`;
+            return `${(price * 1e9).toFixed(2)} nSOL`;
+          };
+          
+          const formatMc = (usd: number): string => {
+            if (usd >= 1_000_000) return `$${(usd / 1_000_000).toFixed(2)}M`;
+            if (usd >= 1_000) return `$${(usd / 1_000).toFixed(1)}k`;
+            return `$${usd.toFixed(0)}`;
+          };
+          const mcDisplay = currentMcUsd > 0 ? formatMc(currentMcUsd) : '?';
+          const sourceTag = source !== 'pump.fun' ? ` [${source}]` : '';
+          logger.info(`  ${emoji} ${symbol}: ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(1)}% (SOL)${pnlSolDisplay} | MC: ${mcDisplay} | ${formatPrice(currentPriceSol)} (entry: ${formatPrice(entryPrice)})${sourceTag}  [x to exit]`);
+          writeStatusFile();
+          
+          // Check TP/SL
+          if (pnlPercent >= AXIOM_AUTO_CONFIG.takeProfitPercent) {
+            logger.success(`  🎯 Take profit hit! (+${pnlPercent.toFixed(1)}%)`);
+            await exitPosition('TP');
+          } else if (pnlPercent <= -AXIOM_AUTO_CONFIG.stopLossPercent) {
+            logger.warn(`  🛑 Stop loss hit! (${pnlPercent.toFixed(1)}%)`);
+            await exitPosition('SL');
+          }
+          return;
         }
       } catch {
-        // DexScreener fetch failed
+        // Price fetch failed
       }
       
       logger.info(`  ⚠️ ${symbol} - Cannot fetch price, position still open  [x to exit manually]`);
       return;
     }
     
-    // Get ACTUAL current price AND MC from DexScreener directly (fast, no candles overhead)
-    let currentPriceSol: number = entryPrice;
-    let currentMcUsd: number = 0;
+    // Token IS in trending - use Axiom's live data directly (faster!)
+    // Calculate price from marketCapSol / supply
+    const axiomPriceSol = token.supply > 0 ? token.marketCapSol / token.supply : 0;
+    const solPriceForMc = await getSolPriceUsd();
+    const axiomMcUsd = token.marketCapSol * solPriceForMc;
     
-    try {
-      const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
-      if (response.ok) {
-        const data = await response.json() as any;
-        const pairs = data?.pairs || [];
-        if (pairs.length > 0) {
-          // Get pair with highest liquidity
-          const topPair = pairs.sort((a: any, b: any) => 
-            (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0)
-          )[0];
-          currentPriceSol = parseFloat(topPair.priceNative) || entryPrice;
-          currentMcUsd = topPair.marketCap || topPair.fdv || 0;
-        }
-      }
-    } catch {
-      // Keep entry price as fallback
+    // Use Axiom data if valid, otherwise fallback
+    let currentPriceSol: number;
+    let currentMcUsd: number;
+    let source: string;
+    
+    if (axiomPriceSol > 0) {
+      currentPriceSol = axiomPriceSol;
+      currentMcUsd = axiomMcUsd;
+      source = 'axiom';
+    } else {
+      // Fallback to other sources
+      const fetched = await fetchCurrentPriceAndMc(mint, entryPrice, platform);
+      currentPriceSol = fetched.priceSol;
+      currentMcUsd = fetched.mcUsd;
+      source = fetched.source;
     }
     
     // Calculate P&L from actual prices (matches paper-trader calculation)
@@ -605,6 +906,22 @@ async function monitorPosition(): Promise<void> {
     const pnlSolDisplay = estimatedPnlSol !== null
       ? ` | ${estimatedPnlSol >= 0 ? '+' : ''}${estimatedPnlSol.toFixed(4)} SOL est`
       : '';
+
+    if (state.currentPosition) {
+      const now = Date.now();
+      const lastPrice = state.currentPosition.lastPriceSol;
+      const movePercent = lastPrice > 0
+        ? Math.abs((currentPriceSol - lastPrice) / lastPrice) * 100
+        : 0;
+      if (movePercent >= AXIOM_AUTO_CONFIG.stagnantMinMovePercent) {
+        state.currentPosition.lastPriceSol = currentPriceSol;
+        state.currentPosition.lastMoveTime = now;
+      } else if (now - state.currentPosition.lastMoveTime >= AXIOM_AUTO_CONFIG.stagnantExitSeconds * 1000) {
+        logger.warn(`  💤 No meaningful price action for ${AXIOM_AUTO_CONFIG.stagnantExitSeconds}s (${movePercent.toFixed(2)}% move). Closing position.`);
+        await exitPosition('STAGNANT');
+        return;
+      }
+    }
     
     // Format price for readability (show in readable units)
     const formatPrice = (price: number): string => {
@@ -621,14 +938,23 @@ async function monitorPosition(): Promise<void> {
     };
     
     const mcDisplay = currentMcUsd > 0 ? formatMc(currentMcUsd) : '?';
+    const sourceTag = source !== 'pump.fun' ? ` [${source}]` : '';
     // P&L is in SOL terms (accurate), MC is just current reference
-    logger.info(`  ${emoji} ${symbol}: ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(1)}% (SOL)${pnlSolDisplay} | MC: ${mcDisplay} | ${formatPrice(currentPriceSol)} (entry: ${formatPrice(entryPrice)})  [x to exit]`);
+    logger.info(`  ${emoji} ${symbol}: ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(1)}% (SOL)${pnlSolDisplay} | MC: ${mcDisplay} | ${formatPrice(currentPriceSol)} (entry: ${formatPrice(entryPrice)})${sourceTag}  [x to exit]`);
+    
+    if (state.currentPosition) {
+      state.currentPosition.lastPnlPercent = pnlPercent;
+      state.currentPosition.lastMcUsd = currentMcUsd;
+      state.currentPosition.estimatedPnlSol = estimatedPnlSol ?? undefined;
+      state.currentPosition.costBasisSol = position?.costBasis ?? undefined;
+    }
+    writeStatusFile();
     
     // Check TP/SL
     if (pnlPercent >= AXIOM_AUTO_CONFIG.takeProfitPercent) {
       logger.success(`  🎯 Take profit hit! (+${pnlPercent.toFixed(1)}%)`);
       await exitPosition('TP');
-    } else if (pnlPercent <= AXIOM_AUTO_CONFIG.stopLossPercent) {
+    } else if (pnlPercent <= -AXIOM_AUTO_CONFIG.stopLossPercent) {
       logger.warn(`  🛑 Stop loss hit! (${pnlPercent.toFixed(1)}%)`);
       await exitPosition('SL');
     }
@@ -636,6 +962,136 @@ async function monitorPosition(): Promise<void> {
   } catch (error) {
     logger.info(`  ⚠️ Error monitoring ${symbol}: ${error}  [x to exit manually]`);
   }
+}
+
+// Approximate SOL price for USD→SOL conversion (updated periodically)
+let cachedSolPriceUsd = 200; // Conservative default
+let solPriceLastFetched = 0;
+
+async function getSolPriceUsd(): Promise<number> {
+  // Cache for 60 seconds
+  if (Date.now() - solPriceLastFetched < 60000) {
+    return cachedSolPriceUsd;
+  }
+  try {
+    const response = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+    if (response.ok) {
+      const data = await response.json() as any;
+      cachedSolPriceUsd = data?.solana?.usd || cachedSolPriceUsd;
+      solPriceLastFetched = Date.now();
+    }
+  } catch {
+    // Use cached value
+  }
+  return cachedSolPriceUsd;
+}
+
+async function fetchCurrentPriceAndMc(
+  mint: string,
+  entryPrice: number,
+  platform: 'pump.fun' | 'jupiter'
+): Promise<{ priceSol: number; mcUsd: number; source: string }> {
+  // PRIORITY 1: Use WebSocket price if available (most real-time!)
+  if (wsPrice && wsPrice.priceSol > 0 && (Date.now() - wsPrice.timestamp) < 5000) {
+    return {
+      priceSol: wsPrice.priceSol,
+      mcUsd: wsPrice.mcUsd,
+      source: 'axiom-ws',
+    };
+  }
+  
+  // For pump.fun tokens (not graduated), use LIVE fetch (bypasses all caching)
+  if (platform === 'pump.fun') {
+    const pumpToken = await fetchPumpFunTokenLive(mint);
+    if (pumpToken && !pumpToken.isGraduated && pumpToken.priceSol > 0) {
+      return {
+        priceSol: pumpToken.priceSol,
+        mcUsd: pumpToken.marketCapUsd || 0,
+        source: 'pump.fun',
+      };
+    }
+    // If graduated, fall through to Axiom
+  }
+
+  // PRIORITY 2: Try Axiom chart API (1s candles for most real-time data)
+  try {
+    const livePrice = await getAxiomLivePrice(mint);
+    if (livePrice && livePrice.priceSol > 0) {
+      // Get supply from trending to calculate accurate MC
+      const axiomToken = await getAxiomTokenByMint(mint, '5m');
+      const supply = axiomToken?.supply || 1_000_000_000;
+      const solPriceUsd = await getSolPriceUsd();
+      const mcUsd = livePrice.priceSol * supply * solPriceUsd;
+      return {
+        priceSol: livePrice.priceSol,
+        mcUsd,
+        source: 'axiom-chart',
+      };
+    }
+  } catch (err) {
+    logger.debug(`Axiom chart failed for ${mint.slice(0, 8)}...: ${err}`);
+  }
+  
+  // PRIORITY 3: Try Axiom trending feed (updates less frequently)
+  try {
+    const axiomToken = await getAxiomTokenByMint(mint, '5m');
+    if (axiomToken && axiomToken.supply > 0) {
+      const priceSol = axiomToken.marketCapSol / axiomToken.supply;
+      const solPriceUsd = await getSolPriceUsd();
+      const mcUsd = axiomToken.marketCapSol * solPriceUsd;
+      if (priceSol > 0) {
+        return {
+          priceSol,
+          mcUsd,
+          source: 'axiom-feed',
+        };
+      }
+    }
+  } catch (err) {
+    logger.debug(`Axiom feed failed for ${mint.slice(0, 8)}...: ${err}`);
+  }
+  
+  // Try Axiom batch prices as backup
+  try {
+    const axiomPrices = await getAxiomBatchPrices([mint]);
+    const priceData = axiomPrices[mint];
+    if (priceData && priceData.price > 0) {
+      const solPrice = await getSolPriceUsd();
+      const priceSol = priceData.price / solPrice;
+      // Estimate MC from price (assuming 1B supply for memecoins)
+      const estimatedMcUsd = priceData.price * 1_000_000_000;
+      return {
+        priceSol,
+        mcUsd: estimatedMcUsd,
+        source: 'axiom',
+      };
+    } else {
+      logger.debug(`Axiom batch-prices returned no data for ${mint.slice(0, 8)}...`);
+    }
+  } catch (err) {
+    logger.debug(`Axiom batch-prices failed for ${mint.slice(0, 8)}...: ${err}`);
+  }
+
+  // Fallback to DexScreener if Axiom fails
+  try {
+    const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
+    if (response.ok) {
+      const data = await response.json() as any;
+      const pairs = data?.pairs || [];
+      if (pairs.length > 0) {
+        const topPair = pairs.sort((a: any, b: any) =>
+          (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0)
+        )[0];
+        const priceSol = parseFloat(topPair.priceNative) || entryPrice;
+        const mcUsd = topPair.marketCap || topPair.fdv || 0;
+        return { priceSol, mcUsd, source: 'dexscreener' };
+      }
+    }
+  } catch {
+    // Keep entry price as fallback
+  }
+
+  return { priceSol: entryPrice, mcUsd: 0, source: 'fallback' };
 }
 
 async function exitPosition(reason: string): Promise<void> {
@@ -654,12 +1110,20 @@ async function exitPosition(reason: string): Promise<void> {
       logger.success(`  ${pnlEmoji} Position closed: ${trade.pnl !== undefined ? (trade.pnl >= 0 ? '+' : '') + trade.pnl.toFixed(4) : '0'} SOL${pnlPercentDisplay} (${reason})`);
     }
     
+    // Unsubscribe from WebSocket price updates
+    if (wsPriceUnsubscribe) {
+      wsPriceUnsubscribe();
+      wsPriceUnsubscribe = null;
+      wsPrice = null;
+    }
+    
     // Add to recently traded so it won't be picked again
     state.recentlyTraded.add(mint);
     logger.info(`  Token ${symbol} added to cooldown list - will not be picked again this session`);
     
     state.currentPosition = null;
     state.lastTradeTime = Date.now();
+    writeStatusFile();
     
     logger.info('  Resuming token discovery...\n');
     
@@ -776,6 +1240,7 @@ async function shutdown(): Promise<void> {
   logger.header('SHUTTING DOWN');
   
   state.isRunning = false;
+  writeStatusFile();
   
   // Show final stats
   displayFinalStats();
@@ -797,6 +1262,7 @@ function displayConfig(): void {
     `Position size: ${AXIOM_AUTO_CONFIG.positionSizeSol} SOL`,
     `Take profit: +${AXIOM_AUTO_CONFIG.takeProfitPercent}%`,
     `Stop loss: ${AXIOM_AUTO_CONFIG.stopLossPercent}%`,
+    `Stagnant exit: ${AXIOM_AUTO_CONFIG.stagnantExitSeconds}s @ ${AXIOM_AUTO_CONFIG.stagnantMinMovePercent}%`,
   ]);
 }
 

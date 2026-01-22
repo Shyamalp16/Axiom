@@ -12,9 +12,18 @@ import { POSITION_SIZING, DAILY_LIMITS, WEEKLY_LIMITS } from '../config/index.js
 import { Position, OrderReason } from '../types/index.js';
 import { getWalletBalance } from '../utils/solana.js';
 import logger from '../utils/logger.js';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { join } from 'path';
+
+const DATA_DIR = './data';
+const POSITIONS_FILE = join(DATA_DIR, 'positions.json');
+
+if (!existsSync(DATA_DIR)) {
+  mkdirSync(DATA_DIR, { recursive: true });
+}
 
 // In-memory position store (would use DB in production)
-let activePositions: Position[] = [];
+let activePositions: Position[] = loadPositions();
 let dailyStats = {
   date: new Date().toDateString(),
   tradeCount: 0,
@@ -145,6 +154,7 @@ export function createPosition(
   };
   
   activePositions.push(position);
+  savePositions(activePositions);
   dailyStats.tradeCount++;
   
   logger.trade('BUY', `Opened position: ${symbol}`);
@@ -175,6 +185,8 @@ export function addTranche(
     timestamp: new Date(),
   });
   
+  savePositions(activePositions);
+  
   logger.trade('BUY', `Added tranche to ${position.symbol}`);
   logger.info(`  +${size.toFixed(3)} SOL @ $${price.toFixed(6)}`);
   
@@ -195,6 +207,8 @@ export function updatePosition(positionId: string, currentPrice: number): Positi
   const currentValue = position.quantity * currentPrice;
   position.unrealizedPnl = currentValue - position.costBasis;
   position.unrealizedPnlPercent = (position.unrealizedPnl / position.costBasis) * 100;
+  
+  savePositions(activePositions);
   
   return position;
 }
@@ -234,11 +248,13 @@ export function closePosition(
   if (position.quantity <= 0.0001 || percentToSell >= 100) {
     position.status = 'closed';
     activePositions = activePositions.filter(p => p.id !== positionId);
+    savePositions(activePositions);
     logger.info(`  Position fully closed`);
     return { pnl, remainingPosition: null };
   }
   
   position.status = 'partial_exit';
+  savePositions(activePositions);
   return { pnl, remainingPosition: position };
 }
 
@@ -246,6 +262,7 @@ export function closePosition(
  * Get all active positions
  */
 export function getActivePositions(): Position[] {
+  refreshPositionsFromDisk();
   return [...activePositions];
 }
 
@@ -253,6 +270,7 @@ export function getActivePositions(): Position[] {
  * Get position by ID
  */
 export function getPosition(positionId: string): Position | undefined {
+  refreshPositionsFromDisk();
   return activePositions.find(p => p.id === positionId);
 }
 
@@ -260,6 +278,7 @@ export function getPosition(positionId: string): Position | undefined {
  * Get position by mint address
  */
 export function getPositionByMint(mint: string): Position | undefined {
+  refreshPositionsFromDisk();
   return activePositions.find(p => p.mint === mint);
 }
 
@@ -313,4 +332,37 @@ function getTimeInTrade(position: Position): string {
  */
 function generateId(): string {
   return `pos_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+}
+
+function loadPositions(): Position[] {
+  try {
+    if (!existsSync(POSITIONS_FILE)) {
+      return [];
+    }
+    const data = readFileSync(POSITIONS_FILE, 'utf-8');
+    const raw = JSON.parse(data) as Position[];
+    return raw.map(position => ({
+      ...position,
+      entryTime: new Date(position.entryTime),
+      tranches: (position.tranches || []).map(tranche => ({
+        ...tranche,
+        timestamp: new Date(tranche.timestamp),
+      })),
+    }));
+  } catch (error) {
+    logger.error('Failed to load positions', error);
+    return [];
+  }
+}
+
+function savePositions(positions: Position[]): void {
+  try {
+    writeFileSync(POSITIONS_FILE, JSON.stringify(positions, null, 2));
+  } catch (error) {
+    logger.error('Failed to save positions', error);
+  }
+}
+
+function refreshPositionsFromDisk(): void {
+  activePositions = loadPositions();
 }
