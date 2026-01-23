@@ -1,4 +1,4 @@
-add a blocklist.
-UI
-add another pipeline wiht https://pypi.org/project/axiomtradeapi/ or https://github.com/vibheksoni/axiomtrade-rs?tab=readme-ov-file
-exit switch.
+fix price action
+make helius for even graduated coins
+figure out perfect constrains
+find a trading algo
