@@ -158,6 +158,7 @@ npm run paper              # Interactive paper trading menu
 npm run paper:stats        # View paper trading statistics
 npm run paper:reset        # Reset paper portfolio (default 2 SOL)
 npm run paper:export       # Export paper trades to CSV
+npm run test:tracker       # wallet tracker
 ```
 
 ### Axiom Auto-Trading (Alternative Data Source)
@@ -325,4 +326,5 @@ MIT
 ---
 
 *Built for survival in the memecoin trenches. Stay disciplined.* 🎯
+
 
