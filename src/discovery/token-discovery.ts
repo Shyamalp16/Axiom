@@ -6,12 +6,14 @@
  * Strategies:
  * 1. Currently Live - tokens being actively traded right now
  * 2. Volatile - tokens with high price movement
- * 3. Watch & Revisit - track new tokens and check for growth after delay
+ * 3. Featured - pump.fun trending/featured tokens with holder analytics
+ * 4. Newest - freshly created tokens sorted by timestamp
+ * 5. Watch & Revisit - track new tokens and check for growth after delay
  * 
  * Filters candidates by:
- * - Age: 1-30 minutes
- * - Bonding curve progress: 15-85%
- * - Market cap: $3k - $50k
+ * - Age: 1-60 minutes
+ * - Bonding curve progress: 15-99%
+ * - Market cap: $3k - $60k
  * - Engagement: minimum trades
  */
 
@@ -24,6 +26,7 @@ import {
   PumpPortalNewToken,
   fetchCurrentlyLiveCoins,
   fetchVolatileCoins,
+  fetchFeaturedCoins,
   fetchTokenViaPumpPortal,
 } from '../api/pump-portal.js';
 import { CandidateQueue } from './candidate-queue.js';
@@ -71,7 +74,7 @@ export const DISCOVERY_CONFIG = {
 };
 
 // Discovery strategies
-type DiscoveryStrategy = 'live' | 'volatile' | 'newest';
+type DiscoveryStrategy = 'live' | 'volatile' | 'newest' | 'featured';
 
 /**
  * Token Discovery Class
@@ -89,7 +92,7 @@ export class TokenDiscovery {
   
   // Multi-strategy state
   private currentStrategy: DiscoveryStrategy = 'live';
-  private strategyRotation: DiscoveryStrategy[] = ['live', 'volatile', 'newest'];
+  private strategyRotation: DiscoveryStrategy[] = ['live', 'volatile', 'featured', 'newest'];
   private strategyIndex: number = 0;
   
   // Watch & Revisit
@@ -220,6 +223,10 @@ export class TokenDiscovery {
           break;
         case 'volatile':
           tokens = await fetchVolatileCoins();
+          break;
+        case 'featured':
+          // Try 1h window first for fresher trending tokens
+          tokens = await fetchFeaturedCoins('1h', DISCOVERY_CONFIG.pollLimit);
           break;
         case 'newest':
           logger.info('🆕 Fetching NEWEST tokens via searchCoins...');

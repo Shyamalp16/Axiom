@@ -969,6 +969,7 @@ export async function fetchMultipleTokens(mints: string[]): Promise<PumpPortalTo
 /**
  * Get currently live coins on pump.fun
  * GET /coins/currently-live
+ * Only returns tokens still on bonding curve (not graduated)
  */
 export async function fetchCurrentlyLiveCoins(
   limit: number = 50,
@@ -998,8 +999,12 @@ export async function fetchCurrentlyLiveCoins(
     const tokens: PumpPortalToken[] = [];
     
     for (const data of dataArray) {
-      if (data && data.mint) {
-        const token = await convertApiResponseToToken(data);
+      // Skip graduated tokens (complete=true or has raydium_pool)
+      if (!data || !data.mint || data.complete === true || data.raydium_pool) {
+        continue;
+      }
+      const token = await convertApiResponseToToken(data);
+      if (!token.isGraduated) {
         tokens.push(token);
       }
     }
@@ -1135,6 +1140,7 @@ export async function fetchGraduatedCoins(
 /**
  * Get most volatile coins by score
  * GET /coins/volatile (Volatility API v2)
+ * Only returns tokens still on bonding curve (not graduated)
  */
 export async function fetchVolatileCoins(): Promise<PumpPortalToken[]> {
   try {
@@ -1154,8 +1160,12 @@ export async function fetchVolatileCoins(): Promise<PumpPortalToken[]> {
     const tokens: PumpPortalToken[] = [];
     
     for (const data of dataArray) {
-      if (data && data.mint) {
-        const token = await convertApiResponseToToken(data);
+      // Skip graduated tokens (complete=true or has raydium_pool)
+      if (!data || !data.mint || data.complete === true || data.raydium_pool) {
+        continue;
+      }
+      const token = await convertApiResponseToToken(data);
+      if (!token.isGraduated) {
         tokens.push(token);
       }
     }
@@ -1170,6 +1180,7 @@ export async function fetchVolatileCoins(): Promise<PumpPortalToken[]> {
 /**
  * Get featured coins with holder analytics
  * GET /coins/featured (Advanced API v2)
+ * Only returns tokens still on bonding curve (not graduated)
  */
 export async function fetchFeaturedCoins(
   timeWindow: '1h' | '6h' | '24h' = '24h',
@@ -1199,8 +1210,12 @@ export async function fetchFeaturedCoins(
     const tokens: PumpPortalToken[] = [];
     
     for (const data of dataArray) {
-      if (data && data.mint) {
-        const token = await convertApiResponseToToken(data);
+      // Skip graduated tokens (complete=true or has raydium_pool)
+      if (!data || !data.mint || data.complete === true || data.raydium_pool) {
+        continue;
+      }
+      const token = await convertApiResponseToToken(data);
+      if (!token.isGraduated) {
         tokens.push(token);
       }
     }
