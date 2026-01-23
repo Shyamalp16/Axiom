@@ -22,6 +22,7 @@
     "test:discovery": "tsx src/cli/test-discovery.ts",
     "test:price": "tsx src/cli/test-price-monitor.ts",
     "test:axiom": "tsx src/cli/test-axiom.ts",
+    "test:tracker": "tsx src/cli/test-wallet-tracker.ts",
     "axiom:auto": "cross-env PAPER_TRADE=true tsx src/cli/axiom-auto.ts",
     "axiom:status": "tsx src/cli/axiom-auto.ts status",
     "ui": "tsx src/server/index.ts",

@@ -1034,6 +1034,446 @@ export function isAxiomWSConnected(): boolean {
 }
 
 // ============================================
+// WALLET TRACKER API
+// ============================================
+
+// Wallet tracker API endpoint (uses different base URL)
+const AXIOM_TRACKER_API = 'https://api-bny.axiom.trade';
+
+// Tracked wallet interface
+export interface AxiomTrackedWallet {
+  id: number;
+  trackedWalletAddress: string;
+  name: string;
+  emoji: string;
+  alertsOnToast: boolean;
+  alertsOnBubble: boolean;
+  alertsOnFeed: boolean;
+  createdAt: string;
+  sound: string | null;
+  groupIds: number[];
+  solBalance: number;
+  lastActiveAt: string;
+}
+
+// Tracker group interface
+export interface AxiomTrackerGroup {
+  groupId: number;
+  groupName: string;
+  groupEmoji: string;
+  groupColor: string | null;
+}
+
+// Tracked wallets response
+export interface AxiomTrackedWalletsResponse {
+  status?: string;
+  data?: {
+    groups: AxiomTrackerGroup[];
+    trackedWallets: AxiomTrackedWallet[];
+  };
+  // Direct format (without wrapper)
+  groups?: AxiomTrackerGroup[];
+  trackedWallets?: AxiomTrackedWallet[];
+}
+
+// Tracked wallet transaction
+export interface AxiomWalletTransaction {
+  transactionTime: string;
+  walletAddress: string;
+  signature: string;
+  priceSol: number;
+  priceUsd: number;
+  tokenAmount: number;
+  totalSol: number;
+  totalUsd: number;
+  feesSol: number;
+  type: 'buy' | 'sell';
+  detailedType: 'First Buy' | 'Buy More' | 'Sell Partial' | 'Sell All' | 'Add Liquidity' | 'Remove Liquidity' | 'Unknown';
+  pairAddress: string;
+  pairCreatedAt: string;
+  averageMcBought: number | null;
+  averageMcSold: number | null;
+  pnlSol: number;
+  tokenAddress: string;
+  tokenName: string;
+  tokenTicker: string;
+  tokenImage: string;
+  tokenDecimals: number;
+  supply: number;
+  realProtocol: string;
+  isMigrated: boolean;
+  liquiditySol: number;
+}
+
+// Transaction filter options
+export interface AxiomTransactionFilter {
+  detailedTypes?: string[];
+  tokenMinsAgoCreated?: { min: number | null; max: number | null };
+  marketCap?: { min: number | null; max: number | null };
+  totalSol?: { min: number | null; max: number | null };
+  walletAddresses?: string[]; // Filter by specific wallets
+}
+
+/**
+ * Make authenticated request to tracker API
+ */
+async function axiomTrackerFetch<T>(
+  endpoint: string,
+  options: RequestInit = {}
+): Promise<T> {
+  const token = await getAccessToken();
+  
+  const headers: Record<string, string> = {
+    'Accept': 'application/json, text/plain, */*',
+    'Content-Type': 'application/json',
+    'Cookie': `auth-access-token=${token}; auth-refresh-token=${refreshToken}`,
+    'Origin': 'https://axiom.trade',
+    'Referer': 'https://axiom.trade/',
+    'x-target-host': 'api3.axiom.trade',
+    ...(options.headers as Record<string, string> || {}),
+  };
+  
+  const response = await fetch(`${AXIOM_TRACKER_API}${endpoint}`, {
+    ...options,
+    headers,
+  });
+  
+  if (response.status === 401) {
+    // Token might have expired, try refresh
+    await refreshAccessToken();
+    const newToken = await getAccessToken();
+    headers['Cookie'] = `auth-access-token=${newToken}; auth-refresh-token=${refreshToken}`;
+    
+    const retryResponse = await fetch(`${AXIOM_TRACKER_API}${endpoint}`, {
+      ...options,
+      headers,
+    });
+    
+    if (!retryResponse.ok) {
+      throw new Error(`Axiom Tracker API error: ${retryResponse.status}`);
+    }
+    
+    return retryResponse.json() as Promise<T>;
+  }
+  
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Axiom Tracker API error ${response.status}: ${errorText}`);
+  }
+  
+  return response.json() as Promise<T>;
+}
+
+/**
+ * Get all tracked wallets from your Axiom account
+ */
+export async function getAxiomTrackedWallets(): Promise<{
+  groups: AxiomTrackerGroup[];
+  trackedWallets: AxiomTrackedWallet[];
+}> {
+  const response = await axiomTrackerFetch<AxiomTrackedWalletsResponse>('/tracked-wallets-v2?v=2', {
+    method: 'GET',
+  });
+  
+  // Handle both response formats
+  if (response.data) {
+    return {
+      groups: response.data.groups,
+      trackedWallets: response.data.trackedWallets,
+    };
+  }
+  
+  return {
+    groups: response.groups || [],
+    trackedWallets: response.trackedWallets || [],
+  };
+}
+
+/**
+ * Get transactions for all tracked wallets
+ * @param filter - Optional filters for transaction types, market cap, etc.
+ */
+export async function getAxiomTrackedWalletTransactions(
+  filter?: AxiomTransactionFilter
+): Promise<AxiomWalletTransaction[]> {
+  const defaultFilter = {
+    detailedTypes: ['Buy More', 'First Buy', 'Sell Partial', 'Sell All', 'Add Liquidity', 'Remove Liquidity', 'Unknown'],
+    tokenMinsAgoCreated: { min: null, max: null },
+    marketCap: { min: null, max: null },
+    totalSol: { min: null, max: null },
+    v: 2,
+  };
+  
+  const body = {
+    ...defaultFilter,
+    ...filter,
+    v: 2,
+  };
+  
+  const response = await axiomTrackerFetch<AxiomWalletTransaction[]>('/tracked-wallet-transactions-v2', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+  
+  return response;
+}
+
+/**
+ * Get transactions for specific tracked wallets
+ * @param walletAddresses - Array of wallet addresses to filter
+ * @param filter - Optional additional filters
+ */
+export async function getAxiomWalletTransactionsByAddress(
+  walletAddresses: string[],
+  filter?: Omit<AxiomTransactionFilter, 'walletAddresses'>
+): Promise<AxiomWalletTransaction[]> {
+  const transactions = await getAxiomTrackedWalletTransactions(filter);
+  
+  // Filter by wallet addresses
+  const addressSet = new Set(walletAddresses.map(a => a.toLowerCase()));
+  return transactions.filter(tx => 
+    addressSet.has(tx.walletAddress.toLowerCase())
+  );
+}
+
+/**
+ * Get only BUY transactions from tracked wallets
+ * Useful for copy trading signals
+ */
+export async function getAxiomTrackedWalletBuys(
+  options?: {
+    walletAddresses?: string[];
+    minSolAmount?: number;
+    maxTokenAgeMinutes?: number;
+  }
+): Promise<AxiomWalletTransaction[]> {
+  const filter: AxiomTransactionFilter = {
+    detailedTypes: ['First Buy', 'Buy More'],
+  };
+  
+  if (options?.maxTokenAgeMinutes) {
+    filter.tokenMinsAgoCreated = { min: null, max: options.maxTokenAgeMinutes };
+  }
+  
+  if (options?.minSolAmount) {
+    filter.totalSol = { min: options.minSolAmount, max: null };
+  }
+  
+  let transactions = await getAxiomTrackedWalletTransactions(filter);
+  
+  // Filter by specific wallets if provided
+  if (options?.walletAddresses && options.walletAddresses.length > 0) {
+    const addressSet = new Set(options.walletAddresses.map(a => a.toLowerCase()));
+    transactions = transactions.filter(tx => 
+      addressSet.has(tx.walletAddress.toLowerCase())
+    );
+  }
+  
+  return transactions;
+}
+
+/**
+ * Get recent "First Buy" transactions - these are fresh entries into new tokens
+ * Best signals for copy trading
+ */
+export async function getAxiomTrackedWalletFirstBuys(
+  options?: {
+    walletAddresses?: string[];
+    minSolAmount?: number;
+    maxTokenAgeMinutes?: number;
+    limit?: number;
+  }
+): Promise<AxiomWalletTransaction[]> {
+  const filter: AxiomTransactionFilter = {
+    detailedTypes: ['First Buy'],
+  };
+  
+  if (options?.maxTokenAgeMinutes) {
+    filter.tokenMinsAgoCreated = { min: null, max: options.maxTokenAgeMinutes };
+  }
+  
+  if (options?.minSolAmount) {
+    filter.totalSol = { min: options.minSolAmount, max: null };
+  }
+  
+  let transactions = await getAxiomTrackedWalletTransactions(filter);
+  
+  // Filter by specific wallets if provided
+  if (options?.walletAddresses && options.walletAddresses.length > 0) {
+    const addressSet = new Set(options.walletAddresses.map(a => a.toLowerCase()));
+    transactions = transactions.filter(tx => 
+      addressSet.has(tx.walletAddress.toLowerCase())
+    );
+  }
+  
+  // Sort by time (most recent first)
+  transactions.sort((a, b) => 
+    new Date(b.transactionTime).getTime() - new Date(a.transactionTime).getTime()
+  );
+  
+  // Apply limit if provided
+  if (options?.limit && options.limit > 0) {
+    transactions = transactions.slice(0, options.limit);
+  }
+  
+  return transactions;
+}
+
+// Extended transaction with wallet name
+export interface AxiomWalletTransactionWithName extends AxiomWalletTransaction {
+  walletName?: string;
+  walletEmoji?: string;
+}
+
+/**
+ * Get wallet name map from tracked wallets
+ * Useful for enriching transactions with wallet names
+ */
+export async function getWalletNameMap(): Promise<Map<string, { name: string; emoji: string }>> {
+  const { trackedWallets } = await getAxiomTrackedWallets();
+  const map = new Map<string, { name: string; emoji: string }>();
+  
+  trackedWallets.forEach(w => {
+    map.set(w.trackedWalletAddress.toLowerCase(), {
+      name: w.name,
+      emoji: w.emoji,
+    });
+  });
+  
+  return map;
+}
+
+/**
+ * Enrich transactions with wallet names
+ */
+export function enrichTransactionsWithNames(
+  transactions: AxiomWalletTransaction[],
+  walletNameMap: Map<string, { name: string; emoji: string }>
+): AxiomWalletTransactionWithName[] {
+  return transactions.map(tx => {
+    const walletInfo = walletNameMap.get(tx.walletAddress.toLowerCase());
+    return {
+      ...tx,
+      walletName: walletInfo?.name,
+      walletEmoji: walletInfo?.emoji,
+    };
+  });
+}
+
+/**
+ * Get transactions with wallet names included
+ */
+export async function getAxiomTrackedWalletTransactionsWithNames(
+  filter?: AxiomTransactionFilter
+): Promise<AxiomWalletTransactionWithName[]> {
+  const [transactions, walletNameMap] = await Promise.all([
+    getAxiomTrackedWalletTransactions(filter),
+    getWalletNameMap(),
+  ]);
+  
+  return enrichTransactionsWithNames(transactions, walletNameMap);
+}
+
+/**
+ * Monitor tracked wallets for new transactions
+ * Polls the API at specified interval and calls callback on new transactions
+ */
+export function monitorTrackedWallets(
+  callback: (transactions: AxiomWalletTransactionWithName[]) => void,
+  options?: {
+    pollIntervalMs?: number;
+    walletAddresses?: string[];
+    onlyBuys?: boolean;
+    onlyFirstBuys?: boolean;
+    minSolAmount?: number;
+    includeWalletNames?: boolean;
+  }
+): () => void {
+  const pollInterval = options?.pollIntervalMs || 5000; // Default 5 seconds
+  const includeNames = options?.includeWalletNames !== false; // Default true
+  let lastSeenSignatures = new Set<string>();
+  let walletNameMap: Map<string, { name: string; emoji: string }> | null = null;
+  let isRunning = true;
+  
+  const poll = async () => {
+    if (!isRunning) return;
+    
+    try {
+      // Load wallet name map on first poll if needed
+      if (includeNames && !walletNameMap) {
+        walletNameMap = await getWalletNameMap();
+      }
+      
+      let transactions: AxiomWalletTransaction[];
+      
+      if (options?.onlyFirstBuys) {
+        transactions = await getAxiomTrackedWalletFirstBuys({
+          walletAddresses: options.walletAddresses,
+          minSolAmount: options.minSolAmount,
+        });
+      } else if (options?.onlyBuys) {
+        transactions = await getAxiomTrackedWalletBuys({
+          walletAddresses: options.walletAddresses,
+          minSolAmount: options.minSolAmount,
+        });
+      } else {
+        transactions = await getAxiomTrackedWalletTransactions();
+        
+        // Filter by wallet addresses if provided
+        if (options?.walletAddresses && options.walletAddresses.length > 0) {
+          const addressSet = new Set(options.walletAddresses.map(a => a.toLowerCase()));
+          transactions = transactions.filter(tx => 
+            addressSet.has(tx.walletAddress.toLowerCase())
+          );
+        }
+      }
+      
+      // Find new transactions (not seen before)
+      const newTransactions = transactions.filter(tx => 
+        !lastSeenSignatures.has(tx.signature)
+      );
+      
+      // Update seen signatures
+      transactions.forEach(tx => lastSeenSignatures.add(tx.signature));
+      
+      // Keep set size manageable (last 1000 signatures)
+      if (lastSeenSignatures.size > 1000) {
+        const arr = Array.from(lastSeenSignatures);
+        lastSeenSignatures = new Set(arr.slice(-500));
+      }
+      
+      // Call callback if there are new transactions
+      if (newTransactions.length > 0) {
+        // Enrich with wallet names if enabled
+        const enrichedTxs = includeNames && walletNameMap 
+          ? enrichTransactionsWithNames(newTransactions, walletNameMap)
+          : newTransactions.map(tx => ({ ...tx } as AxiomWalletTransactionWithName));
+        
+        callback(enrichedTxs);
+      }
+      
+    } catch (error) {
+      logger.debug(`Wallet tracker poll error: ${error}`);
+    }
+    
+    // Schedule next poll
+    if (isRunning) {
+      setTimeout(poll, pollInterval);
+    }
+  };
+  
+  // Start polling
+  logger.info(`Starting wallet tracker monitor (polling every ${pollInterval / 1000}s)`);
+  poll();
+  
+  // Return stop function
+  return () => {
+    isRunning = false;
+    logger.info('Wallet tracker monitor stopped');
+  };
+}
+
+// ============================================
 // EXPORTS
 // ============================================
 
@@ -1041,4 +1481,5 @@ export {
   NATIVE_SOL_MINT,
   AXIOM_API_SERVERS,
   AXIOM_WS_CLUSTERS,
+  AXIOM_TRACKER_API,
 };
