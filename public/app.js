@@ -484,6 +484,27 @@ function wireControlActions() {
     loadStats();
     loadPositions();
   });
+
+  document.getElementById('manualEntryForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const mint = document.getElementById('manualEntryInput').value.trim();
+    if (!mint) return;
+    controlStatus.textContent = 'Sending manual entry…';
+    try {
+      const result = await postJson('/api/axiom-auto/manual-entry', { mint });
+      renderActionOutput(result);
+      controlStatus.textContent = 'Manual entry sent';
+      document.getElementById('manualEntryInput').value = '';
+    } catch (error) {
+      renderActionOutput({ error: error instanceof Error ? error.message : 'Manual entry failed' });
+      controlStatus.textContent = error instanceof Error ? error.message : 'Manual entry failed';
+    }
+    // Wait a moment for axiom-auto to process, then refresh
+    setTimeout(() => {
+      loadPositions();
+      loadControl();
+    }, 2000);
+  });
 }
 
 async function bootstrap() {

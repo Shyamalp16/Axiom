@@ -110,12 +110,12 @@ function readAxiomAutoStatus(): any | null {
   }
 }
 
-function sendAxiomAutoCommand(action: string): void {
+function sendAxiomAutoCommand(action: string, data?: Record<string, unknown>): void {
   try {
     if (!existsSync(DATA_DIR)) {
       return;
     }
-    writeFileSync(AXIOM_COMMAND_FILE, JSON.stringify({ action, timestamp: new Date().toISOString() }, null, 2));
+    writeFileSync(AXIOM_COMMAND_FILE, JSON.stringify({ action, ...data, timestamp: new Date().toISOString() }, null, 2));
   } catch {
     // Ignore
   }
@@ -399,6 +399,16 @@ app.get('/api/axiom-auto/status', (_req, res) => {
     return;
   }
   res.json(status);
+});
+
+app.post('/api/axiom-auto/manual-entry', (req, res) => {
+  const mint = req.body?.mint;
+  if (!mint || typeof mint !== 'string' || mint.length < 32) {
+    res.status(400).json({ error: 'Valid mint address required' });
+    return;
+  }
+  sendAxiomAutoCommand('manual_entry', { mint: mint.trim() });
+  res.json({ ok: true, action: 'manual_entry', mint: mint.trim() });
 });
 
 app.post('/api/bot/init', async (_req, res) => {

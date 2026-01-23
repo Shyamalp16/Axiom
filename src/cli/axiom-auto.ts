@@ -64,13 +64,14 @@ const AXIOM_AUTO_CONFIG = {
   
   // Token filtering - BONDING CURVE ONLY (for pumpportal)
   minMarketCapSol: 10,             // Min ~$1.25k at $125 SOL
-  maxMarketCapSol: 80,             // Max 80 SOL (~$10k) - below graduation threshold (85 SOL)
-  minVolumeSol: 5,                 // Minimum 5 SOL volume
+  maxMarketCapSol: 500,            // Max 500 SOL - allow higher MC bonding curve tokens
+  minVolumeSol: 0,                 // Volume not reliable from API, disable check
   maxTop10HoldersPercent: 30,      // Max concentration
-  minBuyCount: 10,                 // Minimum buy transactions
-  maxAgeHours: 2,                  // Only fresh tokens (bonding curve tokens are usually < 2h old)
-  minBondingProgress: 15,          // Min bonding curve progress %
-  maxBondingProgress: 85,          // Max bonding curve progress % (before graduation)
+  minBuyCount: 5,                  // Minimum 5 buy transactions (lowered)
+  minTradesPerMinute: 0.5,         // At least 1 trade every 2 minutes (activity check)
+  maxAgeHours: 6,                  // Allow tokens up to 6 hours old
+  minBondingProgress: 5,           // Min 5% bonding curve progress
+  maxBondingProgress: 99,          // Allow up to 99% (not graduated)
   
   // Trading settings
   maxOpenPositions: 1,             // Only 1 position at a time
@@ -80,6 +81,7 @@ const AXIOM_AUTO_CONFIG = {
   // Exit settings
   takeProfitPercent: 20,           // 20% TP
   stopLossPercent: 8,              // 8% SL (absolute)
+  entryGracePeriodMs: 10000,       // 10 seconds grace period after entry before SL can trigger
   stagnantExitSeconds: 60,         // Auto-exit if no meaningful move (60s - DexScreener updates slowly)
   stagnantMinMovePercent: 0.3,     // Min % move to reset stagnation timer (lowered for low-liquidity tokens)
   priceCheckIntervalMs: 1000,      // Check price every 1 second (was 500ms, too fast for API)
@@ -103,6 +105,7 @@ interface BotState {
     symbol: string;
     entryPrice: number;
     entryMcSol: number;
+    entryTime: number;    // Timestamp when position was entered
     platform: 'pump.fun' | 'jupiter';
     lastPriceSol: number;
     lastMoveTime: number;
@@ -179,12 +182,12 @@ function writeStatusFile(): void {
   }
 }
 
-function readCommandFile(): { action?: string; timestamp?: string } | null {
+function readCommandFile(): { action?: string; mint?: string; timestamp?: string } | null {
   try {
     if (!existsSync(COMMAND_FILE)) return null;
     const raw = readFileSync(COMMAND_FILE, 'utf-8');
     if (!raw) return null;
-    return JSON.parse(raw) as { action?: string; timestamp?: string };
+    return JSON.parse(raw) as { action?: string; mint?: string; timestamp?: string };
   } catch {
     return null;
   }
@@ -323,6 +326,7 @@ async function startBot(): Promise<void> {
         symbol: pos.symbol,
         entryPrice: pos.avgEntryPrice,
         entryMcSol: estimatedEntryMcSol,
+        entryTime: pos.entryTime ? new Date(pos.entryTime).getTime() : Date.now(),  // Use existing entry time or now
         platform: inferredPlatform as 'pump.fun' | 'jupiter',
         lastPriceSol: pos.avgEntryPrice,
         lastMoveTime: Date.now(),
@@ -397,6 +401,14 @@ async function mainLoop(): Promise<void> {
         logger.warn('🔴 Exit command received from UI');
         manualExitRequested = true;
         clearCommandFile();
+      } else if (command?.action === 'manual_entry' && command.mint) {
+        logger.warn(`🟢 Manual entry command received: ${command.mint}`);
+        clearCommandFile();
+        await handleManualEntry(command.mint);
+        // Skip normal loop iteration after manual entry
+        writeStatusFile();
+        await sleep(AXIOM_AUTO_CONFIG.priceCheckIntervalMs);
+        continue;
       }
 
       // If we have a position, monitor it
@@ -601,32 +613,41 @@ function passesAxiomFilter(token: AxiomTrendingToken): { passed: boolean; reason
                       protocol.includes('meteora') ||
                       token.extra?.migratedFrom !== undefined;
   
+  // Skip graduated tokens entirely - we want bonding curve only for Helius
+  if (isGraduated) {
+    return { passed: false, reason: `graduated:${token.protocol}` };
+  }
+  
   // Check if it's on pump.fun bonding curve (NOT graduated)
   const isOnBondingCurve = protocol.includes('pump') && !protocol.includes('amm');
   
-  // For graduated tokens, use higher bar (need volume proof)
-  if (isGraduated) {
-    // Allow graduated tokens but require volume
-    if (token.volumeSol < 10) {
-      return { passed: false, reason: `graduated-low-vol:${token.volumeSol.toFixed(0)}SOL` };
-    }
-    // Graduated tokens can't use Helius, but still tradeable
+  // Must be on bonding curve for Helius to work
+  if (!isOnBondingCurve) {
+    return { passed: false, reason: `not-bonding:${token.protocol}` };
   }
   
-  // For non-bonding curve tokens with high MC, require volume
-  if (!isOnBondingCurve && token.marketCapSol > 85 && token.volumeSol < 5) {
-    return { passed: false, reason: `not-bonding-curve:${token.protocol}` };
+  // Market cap range
+  if (token.marketCapSol < AXIOM_AUTO_CONFIG.minMarketCapSol) {
+    return { passed: false, reason: `mc:${token.marketCapSol.toFixed(0)}SOL<${AXIOM_AUTO_CONFIG.minMarketCapSol}` };
+  }
+  if (token.marketCapSol > AXIOM_AUTO_CONFIG.maxMarketCapSol) {
+    return { passed: false, reason: `mc:${token.marketCapSol.toFixed(0)}SOL>${AXIOM_AUTO_CONFIG.maxMarketCapSol}` };
   }
   
-  // Minimum activity - at least 3 buys
-  if (token.buyCount < 3) {
-    return { passed: false, reason: `buys:${token.buyCount}<3` };
+  // Minimum activity - require meaningful activity
+  if (token.buyCount < AXIOM_AUTO_CONFIG.minBuyCount) {
+    return { passed: false, reason: `buys:${token.buyCount}<${AXIOM_AUTO_CONFIG.minBuyCount}` };
   }
   
-  // Age filter - max 4 hours
+  // Volume check - disabled since API doesn't always provide accurate volume
+  // if (token.volumeSol < AXIOM_AUTO_CONFIG.minVolumeSol) {
+  //   return { passed: false, reason: `vol:${token.volumeSol.toFixed(1)}SOL<${AXIOM_AUTO_CONFIG.minVolumeSol}` };
+  // }
+  
+  // Age filter - use config
   const ageHours = (Date.now() - new Date(token.createdAt).getTime()) / 1000 / 60 / 60;
-  if (ageHours > 4) {
-    return { passed: false, reason: `age:${ageHours.toFixed(1)}h>4h` };
+  if (ageHours > AXIOM_AUTO_CONFIG.maxAgeHours) {
+    return { passed: false, reason: `age:${ageHours.toFixed(1)}h>${AXIOM_AUTO_CONFIG.maxAgeHours}h` };
   }
   
   // Safety: LP burned or mint/freeze authority revoked
@@ -646,24 +667,45 @@ function passesAxiomFilter(token: AxiomTrendingToken): { passed: boolean; reason
  */
 function passesPumpPortalFilter(token: PumpPortalToken): { passed: boolean; reason?: string } {
   // Skip graduated tokens - required for Helius to work
-  if (token.isGraduated || token.marketCapSol > 80) {
-    return { passed: false, reason: `graduated:MC=${token.marketCapSol.toFixed(0)}SOL` };
+  if (token.isGraduated) {
+    return { passed: false, reason: `graduated` };
   }
   
-  // Minimum activity - at least 5 trades
-  if (token.tradeCount < 5) {
-    return { passed: false, reason: `trades:${token.tradeCount}<5` };
+  // Market cap range - not too small, not graduated
+  if (token.marketCapSol < AXIOM_AUTO_CONFIG.minMarketCapSol) {
+    return { passed: false, reason: `mc:${token.marketCapSol.toFixed(0)}SOL<${AXIOM_AUTO_CONFIG.minMarketCapSol}` };
+  }
+  if (token.marketCapSol > AXIOM_AUTO_CONFIG.maxMarketCapSol) {
+    return { passed: false, reason: `mc:${token.marketCapSol.toFixed(0)}SOL>${AXIOM_AUTO_CONFIG.maxMarketCapSol}` };
   }
   
-  // Age filter - prefer newer but allow up to 2 hours
-  const maxAgeMinutes = 120;
+  // Minimum trades - require at least minBuyCount
+  if (token.tradeCount < AXIOM_AUTO_CONFIG.minBuyCount) {
+    return { passed: false, reason: `trades:${token.tradeCount}<${AXIOM_AUTO_CONFIG.minBuyCount}` };
+  }
+  
+  // Age filter - use config value
+  const maxAgeMinutes = AXIOM_AUTO_CONFIG.maxAgeHours * 60;
   if (token.ageMinutes > maxAgeMinutes) {
     return { passed: false, reason: `age:${token.ageMinutes.toFixed(0)}m>${maxAgeMinutes}m` };
   }
   
-  // Minimum bonding progress - avoid brand new (risky)
-  if (token.bondingCurveProgress < 3) {
-    return { passed: false, reason: `progress:${token.bondingCurveProgress.toFixed(0)}%<3%` };
+  // Minimum bonding progress
+  if (token.bondingCurveProgress < AXIOM_AUTO_CONFIG.minBondingProgress) {
+    return { passed: false, reason: `progress:${token.bondingCurveProgress.toFixed(0)}%<${AXIOM_AUTO_CONFIG.minBondingProgress}%` };
+  }
+  
+  // Maximum bonding progress (before graduation)
+  if (token.bondingCurveProgress > AXIOM_AUTO_CONFIG.maxBondingProgress) {
+    return { passed: false, reason: `progress:${token.bondingCurveProgress.toFixed(0)}%>${AXIOM_AUTO_CONFIG.maxBondingProgress}%` };
+  }
+  
+  // Activity check - require minimum trades per minute
+  // A token with 10 trades over 100 minutes = 0.1 trades/min (dead)
+  // A token with 10 trades over 5 minutes = 2 trades/min (active)
+  const tradesPerMinute = token.ageMinutes > 0 ? token.tradeCount / token.ageMinutes : 0;
+  if (tradesPerMinute < AXIOM_AUTO_CONFIG.minTradesPerMinute) {
+    return { passed: false, reason: `activity:${tradesPerMinute.toFixed(1)}t/m<${AXIOM_AUTO_CONFIG.minTradesPerMinute}` };
   }
   
   return { passed: true };
@@ -715,6 +757,7 @@ async function enterTrade(token: AxiomTrendingToken, passedChecks: string[]): Pr
       symbol: token.tokenTicker,
       entryPrice: trade.pricePerToken,
       entryMcSol: token.marketCapSol,  // Store entry MC for ratio-based P&L
+      entryTime: Date.now(),           // Track entry time for grace period
       platform: trade.platform,  // 'pump.fun' or 'jupiter'
       lastPriceSol: trade.pricePerToken,
       lastMoveTime: Date.now(),
@@ -795,10 +838,106 @@ async function enterTrade(token: AxiomTrendingToken, passedChecks: string[]): Pr
   }
 }
 
+/**
+ * Handle manual entry command from UI
+ * Discards any current position and enters the specified token
+ */
+async function handleManualEntry(mint: string): Promise<void> {
+  logger.info(`\n🟢 MANUAL ENTRY: ${mint}`);
+  
+  // 1. Discard any current position (no sell, just abandon it)
+  if (state.currentPosition) {
+    logger.warn(`  Discarding current position: ${state.currentPosition.symbol}`);
+    
+    // Unsubscribe from price feeds
+    if (wsPriceUnsubscribe) {
+      wsPriceUnsubscribe();
+      wsPriceUnsubscribe = null;
+    }
+    if (heliusPriceUnsubscribe) {
+      heliusPriceUnsubscribe();
+      heliusPriceUnsubscribe = null;
+    }
+    
+    // Clear position state (don't sell, just discard)
+    wsPrice = null;
+    heliusPrice = null;
+    state.currentPosition = null;
+    
+    logger.info(`  Previous position discarded (not sold)`);
+  }
+  
+  // 2. Fetch token data
+  logger.info(`  Fetching token data for ${mint.slice(0, 8)}...`);
+  
+  try {
+    // Try PumpPortal first (for bonding curve tokens)
+    const { fetchTokenViaPumpPortal } = await import('../api/pump-portal.js');
+    const pumpToken = await fetchTokenViaPumpPortal(mint);
+    
+    if (pumpToken) {
+      logger.info(`  Found token: ${pumpToken.symbol} (${pumpToken.name})`);
+      logger.info(`  Market Cap: ${pumpToken.marketCapSol.toFixed(2)} SOL (~$${pumpToken.marketCapUsd.toFixed(0)})`);
+      logger.info(`  Bonding Progress: ${pumpToken.bondingCurveProgress.toFixed(1)}%`);
+      logger.info(`  Graduated: ${pumpToken.isGraduated ? 'YES' : 'NO'}`);
+      
+      // Convert to AxiomTrendingToken format
+      const token: AxiomTrendingToken = {
+        pairAddress: pumpToken.bondingCurve || pumpToken.mint,
+        tokenAddress: pumpToken.mint,
+        tokenName: pumpToken.name,
+        tokenTicker: pumpToken.symbol,
+        tokenImage: pumpToken.imageUri,
+        tokenDecimals: 6,
+        protocol: 'Pump Fun',
+        prevMarketCapSol: pumpToken.marketCapSol,
+        marketCapSol: pumpToken.marketCapSol,
+        marketCapPercentChange: 0,
+        liquiditySol: pumpToken.virtualSolReserves,
+        liquidityToken: pumpToken.virtualTokenReserves,
+        volumeSol: 0,
+        buyCount: pumpToken.tradeCount,
+        sellCount: 0,
+        top10Holders: 0,
+        lpBurned: 0,
+        mintAuthority: null,
+        freezeAuthority: null,
+        dexPaid: false,
+        createdAt: new Date(pumpToken.createdTimestamp).toISOString(),
+        supply: 1_000_000_000,
+        userCount: 0,
+      };
+      
+      // Enter the trade
+      await enterTrade(token, ['MANUAL_ENTRY']);
+      logger.success(`  ✅ Manual entry complete: ${pumpToken.symbol}`);
+      return;
+    }
+    
+    // Try Axiom/DexScreener for graduated tokens
+    const axiomToken = await getAxiomTokenByMint(mint, '5m');
+    if (axiomToken) {
+      logger.info(`  Found graduated token via Axiom: ${axiomToken.tokenTicker}`);
+      await enterTrade(axiomToken, ['MANUAL_ENTRY']);
+      logger.success(`  ✅ Manual entry complete: ${axiomToken.tokenTicker}`);
+      return;
+    }
+    
+    logger.error(`  ❌ Could not find token data for ${mint}`);
+    
+  } catch (error) {
+    logger.error(`  ❌ Manual entry failed:`, error);
+  }
+}
+
 async function monitorPosition(): Promise<void> {
   if (!state.currentPosition) return;
   
-  const { mint, pairAddress, symbol, entryPrice, entryMcSol, platform } = state.currentPosition;
+  const { mint, pairAddress, symbol, entryPrice, entryMcSol, entryTime, platform } = state.currentPosition;
+  
+  // Check if we're in the grace period (no SL triggers immediately after entry)
+  const timeSinceEntry = Date.now() - entryTime;
+  const inGracePeriod = timeSinceEntry < AXIOM_AUTO_CONFIG.entryGracePeriodMs;
   
   // Check for manual exit request first
   if (manualExitRequested) {
@@ -862,9 +1001,14 @@ async function monitorPosition(): Promise<void> {
       await exitPosition('TP');
       return true;
     } else if (pnlPercent <= -AXIOM_AUTO_CONFIG.stopLossPercent) {
-      logger.warn(`  🛑 Stop loss hit! (${pnlPercent.toFixed(1)}%)`);
-      await exitPosition('SL');
-      return true;
+      if (inGracePeriod) {
+        const graceRemaining = Math.ceil((AXIOM_AUTO_CONFIG.entryGracePeriodMs - timeSinceEntry) / 1000);
+        logger.debug(`  ⏸️ SL would trigger (${pnlPercent.toFixed(1)}%) but in grace period (${graceRemaining}s remaining)`);
+      } else {
+        logger.warn(`  🛑 Stop loss hit! (${pnlPercent.toFixed(1)}%)`);
+        await exitPosition('SL');
+        return true;
+      }
     }
     return false;
   };
@@ -877,6 +1021,9 @@ async function monitorPosition(): Promise<void> {
       const exited = await processPriceUpdate(heliusPrice.priceSol, heliusPrice.mcUsd, 'helius');
       if (exited) return;
       return; // Helius price used, don't fall through
+    } else if (heliusPriceUnsubscribe && heliusPrice && heliusPrice.priceSol === 0) {
+      // Helius is subscribed but returning 0 - likely bad bonding curve address
+      logger.debug(`  ⚠️ Helius returning 0 price - bonding curve may be wrong, using fallback`);
     }
     
     // PRIORITY 1: Check Axiom WebSocket price (second most real-time)
@@ -902,9 +1049,16 @@ async function monitorPosition(): Promise<void> {
           const currentMcUsd = topPair.marketCap || topPair.fdv || 0;
           
           if (currentPriceSol > 0) {
-            const exited = await processPriceUpdate(currentPriceSol, currentMcUsd, 'dexscreener');
-            if (exited) return;
-            return;
+            // Sanity check: reject prices that are wildly different from entry
+            // A 5x move in seconds is almost certainly bad data
+            const priceRatio = currentPriceSol / entryPrice;
+            if (priceRatio > 5 || priceRatio < 0.2) {
+              logger.warn(`  ⚠️ DexScreener price looks wrong: ${(currentPriceSol * 1e9).toFixed(2)} nSOL vs entry ${(entryPrice * 1e9).toFixed(2)} nSOL (${((priceRatio - 1) * 100).toFixed(0)}%) - skipping`);
+            } else {
+              const exited = await processPriceUpdate(currentPriceSol, currentMcUsd, 'dexscreener');
+              if (exited) return;
+              return;
+            }
           }
         }
       }
@@ -926,6 +1080,13 @@ async function monitorPosition(): Promise<void> {
           platform
         );
         if (currentPriceSol > 0) {
+          // Sanity check: reject wildly different prices
+          const priceRatio = currentPriceSol / entryPrice;
+          if (priceRatio > 5 || priceRatio < 0.2) {
+            logger.warn(`  ⚠️ Price from ${source} looks wrong: ratio=${priceRatio.toFixed(2)}x entry - skipping`);
+            return;
+          }
+          
           const pnlPercent = ((currentPriceSol - entryPrice) / entryPrice) * 100;
           const emoji = pnlPercent >= 0 ? '📈' : '📉';
           const portfolio = getPaperPortfolio();
@@ -979,8 +1140,13 @@ async function monitorPosition(): Promise<void> {
             logger.success(`  🎯 Take profit hit! (+${pnlPercent.toFixed(1)}%)`);
             await exitPosition('TP');
           } else if (pnlPercent <= -AXIOM_AUTO_CONFIG.stopLossPercent) {
-            logger.warn(`  🛑 Stop loss hit! (${pnlPercent.toFixed(1)}%)`);
-            await exitPosition('SL');
+            if (inGracePeriod) {
+              const graceRemaining = Math.ceil((AXIOM_AUTO_CONFIG.entryGracePeriodMs - timeSinceEntry) / 1000);
+              logger.debug(`  ⏸️ SL would trigger (${pnlPercent.toFixed(1)}%) but in grace period (${graceRemaining}s remaining)`);
+            } else {
+              logger.warn(`  🛑 Stop loss hit! (${pnlPercent.toFixed(1)}%)`);
+              await exitPosition('SL');
+            }
           }
           return;
         }
@@ -1073,8 +1239,13 @@ async function monitorPosition(): Promise<void> {
       logger.success(`  🎯 Take profit hit! (+${pnlPercent.toFixed(1)}%)`);
       await exitPosition('TP');
     } else if (pnlPercent <= -AXIOM_AUTO_CONFIG.stopLossPercent) {
-      logger.warn(`  🛑 Stop loss hit! (${pnlPercent.toFixed(1)}%)`);
-      await exitPosition('SL');
+      if (inGracePeriod) {
+        const graceRemaining = Math.ceil((AXIOM_AUTO_CONFIG.entryGracePeriodMs - timeSinceEntry) / 1000);
+        logger.debug(`  ⏸️ SL would trigger (${pnlPercent.toFixed(1)}%) but in grace period (${graceRemaining}s remaining)`);
+      } else {
+        logger.warn(`  🛑 Stop loss hit! (${pnlPercent.toFixed(1)}%)`);
+        await exitPosition('SL');
+      }
     }
     
   } catch (error) {
