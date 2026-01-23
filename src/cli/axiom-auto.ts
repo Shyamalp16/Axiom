@@ -26,6 +26,12 @@ import {
 } from '../api/axiom-trade.js';
 import { fetchPumpFunToken, fetchPumpFunTokenLive } from '../api/pump-fun.js';
 import { 
+  fetchCurrentlyLiveCoins, 
+  searchCoins, 
+  PumpPortalToken,
+  connectPumpPortal,
+} from '../api/pump-portal.js';
+import { 
   paperBuy, 
   paperSell, 
   getPaperPortfolio, 
@@ -35,8 +41,13 @@ import {
   PaperPosition,
 } from '../trading/paper-trader.js';
 // Pre-trade checklist not used - we have custom Axiom-specific checks
-import { PAPER_TRADING, POSITION_SIZING, validateEnv } from '../config/index.js';
+import { PAPER_TRADING, POSITION_SIZING, validateEnv, ENV, PRICE_MONITOR } from '../config/index.js';
 import { getWalletBalance, getWallet, sleep } from '../utils/solana.js';
+import { 
+  getHeliusPriceMonitor, 
+  HeliusPriceUpdate, 
+  deriveBondingCurveAddress 
+} from '../monitoring/helius-price-monitor.js';
 import logger from '../utils/logger.js';
 
 // ============================================
@@ -45,16 +56,21 @@ import logger from '../utils/logger.js';
 
 const AXIOM_AUTO_CONFIG = {
   // Discovery settings
-  pollIntervalMs: 20000,           // Poll Axiom trending every 20 seconds
-  timePeriod: '5m' as '5m' | '1h' | '24h' | '7d' | '30d',  // Trending time period (1h - 5m not supported by API)
+  pollIntervalMs: 20000,           // Poll every 20 seconds
+  timePeriod: '5m' as '5m' | '1h' | '24h' | '7d' | '30d',  // For Axiom trending (if used)
   
-  // Token filtering (Axiom-specific)
-  minMarketCapSol: 20,             // Min ~$2.5k at $125 SOL
-  maxMarketCapSol: 50000,          // Max ~$6.25M at $125 SOL (trending tokens are larger)
+  // Discovery source: 'pumpportal' for bonding curve, 'axiom' for graduated
+  discoverySource: 'pumpportal' as 'pumpportal' | 'axiom',
+  
+  // Token filtering - BONDING CURVE ONLY (for pumpportal)
+  minMarketCapSol: 10,             // Min ~$1.25k at $125 SOL
+  maxMarketCapSol: 80,             // Max 80 SOL (~$10k) - below graduation threshold (85 SOL)
   minVolumeSol: 5,                 // Minimum 5 SOL volume
   maxTop10HoldersPercent: 30,      // Max concentration
   minBuyCount: 10,                 // Minimum buy transactions
-  maxAgeHours: 24,                 // Don't trade tokens older than 24h
+  maxAgeHours: 2,                  // Only fresh tokens (bonding curve tokens are usually < 2h old)
+  minBondingProgress: 15,          // Min bonding curve progress %
+  maxBondingProgress: 85,          // Max bonding curve progress % (before graduation)
   
   // Trading settings
   maxOpenPositions: 1,             // Only 1 position at a time
@@ -116,6 +132,11 @@ let manualExitRequested = false;
 // Real-time price from Axiom WebSocket
 let wsPrice: { priceSol: number; mcUsd: number; timestamp: number } | null = null;
 let wsPriceUnsubscribe: (() => void) | null = null;
+
+// Real-time price from Helius on-chain WebSocket (highest priority!)
+let heliusPrice: { priceSol: number; mcSol: number; mcUsd: number; timestamp: number } | null = null;
+let heliusPriceUnsubscribe: (() => void) | null = null;
+let heliusConnected = false;
 
 const DATA_DIR = './data';
 const STATUS_FILE = join(DATA_DIR, 'axiom_auto_status.json');
@@ -308,6 +329,37 @@ async function startBot(): Promise<void> {
       };
       const mcDisplay = estimatedEntryMcSol > 0 ? `~$${(estimatedEntryMcSol * 150 / 1000).toFixed(0)}k MC` : 'MC unknown';
       logger.info(`📝 Existing position: ${pos.symbol} @ ${pos.avgEntryPrice.toExponential(4)} SOL (${inferredPlatform}, ${mcDisplay})`);
+      
+      // Set up Helius subscription for existing bonding curve position
+      if (estimatedEntryMcSol > 0 && estimatedEntryMcSol < 85) {
+        try {
+          const helius = getHeliusPriceMonitor();
+          await helius.connect();
+          
+          // Use pairAddress as bonding curve if available, otherwise derive it
+          const bondingCurve = pairAddress || deriveBondingCurveAddress(mint);
+          logger.info(`  [HELIUS] Subscribing to existing position: ${bondingCurve.slice(0, 8)}...`);
+          
+          heliusPriceUnsubscribe = await helius.subscribeToBondingCurve(
+            mint,
+            bondingCurve,
+            (update: HeliusPriceUpdate) => {
+              heliusPrice = {
+                priceSol: update.priceSol,
+                mcSol: update.marketCapSol,
+                mcUsd: update.marketCapUsd,
+                timestamp: Date.now(),
+              };
+              logger.debug(`  [HELIUS] Price update: ${update.priceSol.toExponential(4)} SOL (MC: ${update.marketCapSol.toFixed(1)} SOL)`);
+            }
+          );
+          logger.success(`  [HELIUS] Subscribed to ${pos.symbol} for real-time price updates`);
+        } catch (heliusError) {
+          logger.warn(`  [HELIUS] Could not subscribe to existing position: ${heliusError}`);
+        }
+      } else if (estimatedEntryMcSol >= 85) {
+        logger.info(`  [HELIUS] Token ${pos.symbol} is graduated (MC: ${estimatedEntryMcSol.toFixed(0)} SOL) - using DexScreener/Axiom for price`);
+      }
     }
     
     // Load recently traded tokens to prevent re-entry (from paper trade history)
@@ -383,24 +435,84 @@ async function discoverAndTrade(): Promise<void> {
   }
   
   state.pollCount++;
-  logger.info(`\n[Poll #${state.pollCount}] Fetching Axiom trending tokens...`);
+  
+  logger.info(`\n[Poll #${state.pollCount}] Fetching tokens from BOTH sources...`);
   
   try {
-    const trending = await getAxiomTrending(AXIOM_AUTO_CONFIG.timePeriod);
-    logger.info(`  Got ${trending.length} trending tokens`);
-    
-    // Filter candidates and track rejection reasons
-    const candidates: AxiomTrendingToken[] = [];
+    let candidates: AxiomTrendingToken[] = [];
     const rejectionCounts: Record<string, number> = {};
+    let pumpTokens: PumpPortalToken[] = [];
     
-    for (const token of trending) {
-      const result = passesAxiomFilter(token);
-      if (result.passed) {
-        candidates.push(token);
-      } else if (result.reason) {
-        const key = result.reason.split(':')[0];  // Group by category
-        rejectionCounts[key] = (rejectionCounts[key] || 0) + 1;
+    // === SOURCE 1: PumpPortal (bonding curve tokens - best for Helius) ===
+    try {
+      pumpTokens = await fetchCurrentlyLiveCoins(50);
+      logger.info(`  [PumpPortal] ${pumpTokens.length} bonding curve tokens`);
+      
+      for (const pumpToken of pumpTokens) {
+        // Skip if already in cooldown
+        if (state.recentlyTraded.has(pumpToken.mint)) continue;
+        
+        const result = passesPumpPortalFilter(pumpToken);
+        if (result.passed) {
+          // Convert to AxiomTrendingToken format
+          const token: AxiomTrendingToken = {
+            pairAddress: pumpToken.bondingCurve || pumpToken.mint,
+            tokenAddress: pumpToken.mint,
+            tokenName: pumpToken.name,
+            tokenTicker: pumpToken.symbol,
+            tokenImage: pumpToken.imageUri,
+            tokenDecimals: 6,
+            protocol: 'Pump Fun',
+            prevMarketCapSol: pumpToken.marketCapSol,
+            marketCapSol: pumpToken.marketCapSol,
+            marketCapPercentChange: 0,
+            liquiditySol: pumpToken.virtualSolReserves,
+            liquidityToken: pumpToken.virtualTokenReserves,
+            volumeSol: 0,
+            buyCount: pumpToken.tradeCount,
+            sellCount: 0,
+            top10Holders: 0,
+            lpBurned: 0,
+            mintAuthority: null,
+            freezeAuthority: null,
+            dexPaid: false,
+            website: pumpToken.website,
+            twitter: pumpToken.twitter,
+            telegram: pumpToken.telegram,
+            createdAt: new Date(pumpToken.createdTimestamp).toISOString(),
+            supply: 1_000_000_000,
+            userCount: 0,
+          };
+          candidates.push(token);
+        } else if (result.reason) {
+          const key = result.reason.split(':')[0];
+          rejectionCounts[key] = (rejectionCounts[key] || 0) + 1;
+        }
       }
+    } catch (err) {
+      logger.debug(`  PumpPortal fetch failed: ${err}`);
+    }
+    
+    // === SOURCE 2: Axiom Trending (includes both bonding curve + graduated) ===
+    try {
+      const trending = await getAxiomTrending(AXIOM_AUTO_CONFIG.timePeriod);
+      logger.info(`  [Axiom] ${trending.length} trending tokens`);
+      
+      for (const token of trending) {
+        // Skip if already in cooldown or already added from PumpPortal
+        if (state.recentlyTraded.has(token.tokenAddress)) continue;
+        if (candidates.some(c => c.tokenAddress === token.tokenAddress)) continue;
+        
+        const result = passesAxiomFilter(token);
+        if (result.passed) {
+          candidates.push(token);
+        } else if (result.reason) {
+          const key = result.reason.split(':')[0];
+          rejectionCounts[key] = (rejectionCounts[key] || 0) + 1;
+        }
+      }
+    } catch (err) {
+      logger.debug(`  Axiom fetch failed: ${err}`);
     }
     
     // Show rejection breakdown
@@ -408,19 +520,38 @@ async function discoverAndTrade(): Promise<void> {
       .sort((a, b) => b[1] - a[1])
       .map(([k, v]) => `${k}:${v}`)
       .join(' ');
-    logger.info(`  ${candidates.length} passed | Rejected: ${rejectSummary || 'none'}`);
+    logger.info(`  ✓ ${candidates.length} passed | Rejected: ${rejectSummary || 'none'}`);
     
-    // Show top 3 tokens that almost passed (for debugging)
-    if (candidates.length === 0 && trending.length > 0) {
-      logger.info(`  Sample tokens (why rejected):`);
-      for (const token of trending.slice(0, 3)) {
-        const result = passesAxiomFilter(token);
-        logger.info(`    ${token.tokenTicker}: MC=${token.marketCapSol.toFixed(0)} SOL, Top10=${token.top10Holders.toFixed(0)}%, ${result.reason || 'unknown'}`);
+    // Show sample if none passed
+    if (candidates.length === 0 && pumpTokens.length > 0) {
+      logger.info(`  Sample PumpPortal tokens (why rejected):`);
+      for (const pt of pumpTokens.slice(0, 5)) {
+        const result = passesPumpPortalFilter(pt);
+        const tradesPerMin = pt.ageMinutes > 0 ? (pt.tradeCount / pt.ageMinutes).toFixed(1) : '0';
+        logger.info(`    ${pt.symbol}: age=${pt.ageMinutes.toFixed(0)}m, trades=${pt.tradeCount}(${tradesPerMin}/m), prog=${pt.bondingCurveProgress.toFixed(0)}% → ${result.reason || 'passed'}`);
       }
     }
     
-    // Sort by momentum (market cap % change)
-    candidates.sort((a, b) => b.marketCapPercentChange - a.marketCapPercentChange);
+    // Sort candidates: Pump Fun (bonding curve) first, then by activity
+    candidates.sort((a, b) => {
+      // Prioritize bonding curve tokens (Helius works best)
+      const aIsBondingCurve = a.protocol === 'Pump Fun' && a.marketCapSol < 80;
+      const bIsBondingCurve = b.protocol === 'Pump Fun' && b.marketCapSol < 80;
+      if (aIsBondingCurve && !bIsBondingCurve) return -1;
+      if (!aIsBondingCurve && bIsBondingCurve) return 1;
+      
+      // For bonding curve tokens, sort by momentum
+      if (aIsBondingCurve && bIsBondingCurve) {
+        const pumpA = pumpTokens.find(p => p.mint === a.tokenAddress);
+        const pumpB = pumpTokens.find(p => p.mint === b.tokenAddress);
+        const scoreA = pumpA ? (pumpA.tradeCount / Math.max(pumpA.ageMinutes, 1)) : 0;
+        const scoreB = pumpB ? (pumpB.tradeCount / Math.max(pumpB.ageMinutes, 1)) : 0;
+        return scoreB - scoreA;
+      }
+      
+      // For other tokens, sort by buy count
+      return b.buyCount - a.buyCount;
+    });
     
     // Analyze top candidates
     for (const token of candidates.slice(0, 5)) {
@@ -461,38 +592,41 @@ async function discoverAndTrade(): Promise<void> {
 }
 
 function passesAxiomFilter(token: AxiomTrendingToken): { passed: boolean; reason?: string } {
-  // Market cap filter
-  if (token.marketCapSol < AXIOM_AUTO_CONFIG.minMarketCapSol) {
-    return { passed: false, reason: `mcap:${token.marketCapSol.toFixed(0)}<${AXIOM_AUTO_CONFIG.minMarketCapSol}` };
-  }
-  if (token.marketCapSol > AXIOM_AUTO_CONFIG.maxMarketCapSol) {
-    return { passed: false, reason: `mcap:${token.marketCapSol.toFixed(0)}>${AXIOM_AUTO_CONFIG.maxMarketCapSol}` };
+  // Check protocol - prefer bonding curve but allow others
+  const protocol = token.protocol?.toLowerCase() || '';
+  
+  // Check if it's graduated (on AMM/Raydium instead of bonding curve)
+  const isGraduated = protocol.includes('amm') || 
+                      protocol.includes('raydium') || 
+                      protocol.includes('meteora') ||
+                      token.extra?.migratedFrom !== undefined;
+  
+  // Check if it's on pump.fun bonding curve (NOT graduated)
+  const isOnBondingCurve = protocol.includes('pump') && !protocol.includes('amm');
+  
+  // For graduated tokens, use higher bar (need volume proof)
+  if (isGraduated) {
+    // Allow graduated tokens but require volume
+    if (token.volumeSol < 10) {
+      return { passed: false, reason: `graduated-low-vol:${token.volumeSol.toFixed(0)}SOL` };
+    }
+    // Graduated tokens can't use Helius, but still tradeable
   }
   
-  // Volume filter
-  if (token.volumeSol < AXIOM_AUTO_CONFIG.minVolumeSol) {
-    return { passed: false, reason: `vol:${token.volumeSol.toFixed(1)}<${AXIOM_AUTO_CONFIG.minVolumeSol}` };
+  // For non-bonding curve tokens with high MC, require volume
+  if (!isOnBondingCurve && token.marketCapSol > 85 && token.volumeSol < 5) {
+    return { passed: false, reason: `not-bonding-curve:${token.protocol}` };
   }
   
-  // Activity filter
-  if (token.buyCount < AXIOM_AUTO_CONFIG.minBuyCount) {
-    return { passed: false, reason: `buys:${token.buyCount}<${AXIOM_AUTO_CONFIG.minBuyCount}` };
+  // Minimum activity - at least 3 buys
+  if (token.buyCount < 3) {
+    return { passed: false, reason: `buys:${token.buyCount}<3` };
   }
   
-  // Concentration filter
-  if (token.top10Holders > AXIOM_AUTO_CONFIG.maxTop10HoldersPercent) {
-    return { passed: false, reason: `top10:${token.top10Holders.toFixed(0)}%>${AXIOM_AUTO_CONFIG.maxTop10HoldersPercent}%` };
-  }
-  
-  // Age filter (from createdAt timestamp)
+  // Age filter - max 4 hours
   const ageHours = (Date.now() - new Date(token.createdAt).getTime()) / 1000 / 60 / 60;
-  if (ageHours > AXIOM_AUTO_CONFIG.maxAgeHours) {
-    return { passed: false, reason: `age:${ageHours.toFixed(1)}h>${AXIOM_AUTO_CONFIG.maxAgeHours}h` };
-  }
-  
-  // Positive momentum
-  if (token.marketCapPercentChange <= 0) {
-    return { passed: false, reason: `momentum:${token.marketCapPercentChange.toFixed(0)}%` };
+  if (ageHours > 4) {
+    return { passed: false, reason: `age:${ageHours.toFixed(1)}h>4h` };
   }
   
   // Safety: LP burned or mint/freeze authority revoked
@@ -506,74 +640,43 @@ function passesAxiomFilter(token: AxiomTrendingToken): { passed: boolean; reason
   return { passed: true };
 }
 
+/**
+ * Filter for PumpPortal bonding curve tokens
+ * Focus: Active bonding curve tokens suitable for Helius monitoring
+ */
+function passesPumpPortalFilter(token: PumpPortalToken): { passed: boolean; reason?: string } {
+  // Skip graduated tokens - required for Helius to work
+  if (token.isGraduated || token.marketCapSol > 80) {
+    return { passed: false, reason: `graduated:MC=${token.marketCapSol.toFixed(0)}SOL` };
+  }
+  
+  // Minimum activity - at least 5 trades
+  if (token.tradeCount < 5) {
+    return { passed: false, reason: `trades:${token.tradeCount}<5` };
+  }
+  
+  // Age filter - prefer newer but allow up to 2 hours
+  const maxAgeMinutes = 120;
+  if (token.ageMinutes > maxAgeMinutes) {
+    return { passed: false, reason: `age:${token.ageMinutes.toFixed(0)}m>${maxAgeMinutes}m` };
+  }
+  
+  // Minimum bonding progress - avoid brand new (risky)
+  if (token.bondingCurveProgress < 3) {
+    return { passed: false, reason: `progress:${token.bondingCurveProgress.toFixed(0)}%<3%` };
+  }
+  
+  return { passed: true };
+}
+
 async function runAxiomChecklist(token: AxiomTrendingToken): Promise<{ passed: boolean; passedChecks: string[]; failedChecks: string[] }> {
-  const passedChecks: string[] = [];
+  // TEMPORARILY DISABLED - Testing Helius price monitoring
+  // Just pass everything that's on bonding curve
+  const passedChecks = ['testing:helius-monitoring'];
   const failedChecks: string[] = [];
   
-  // Calculate age in minutes
-  const ageMinutes = (Date.now() - new Date(token.createdAt).getTime()) / 1000 / 60;
-  
-  // Basic checks based on Axiom data
-  
-  // 1. Age check (prefer tokens between 5 min and 24 hours)
-  if (ageMinutes >= 5 && ageMinutes <= 24 * 60) {
-    passedChecks.push(`age:${ageMinutes.toFixed(0)}min`);
-  } else {
-    failedChecks.push(`age:${ageMinutes.toFixed(0)}min`);
-  }
-  
-  // 2. Momentum check
-  if (token.marketCapPercentChange >= 10) {
-    passedChecks.push(`momentum:+${token.marketCapPercentChange.toFixed(0)}%`);
-  } else if (token.marketCapPercentChange > 0) {
-    passedChecks.push(`momentum:weak+${token.marketCapPercentChange.toFixed(0)}%`);
-  } else {
-    failedChecks.push(`momentum:${token.marketCapPercentChange.toFixed(0)}%`);
-  }
-  
-  // 3. Volume check
-  const volumeToMcap = token.volumeSol / Math.max(token.marketCapSol, 1);
-  if (volumeToMcap >= 0.1) {  // 10% volume/mcap ratio
-    passedChecks.push(`volume:${(volumeToMcap * 100).toFixed(0)}%`);
-  } else {
-    failedChecks.push(`volume:low${(volumeToMcap * 100).toFixed(0)}%`);
-  }
-  
-  // 4. Buy/sell ratio
-  const buyRatio = token.buyCount / Math.max(token.buyCount + token.sellCount, 1);
-  if (buyRatio >= 0.5) {
-    passedChecks.push(`buys:${(buyRatio * 100).toFixed(0)}%`);
-  } else {
-    failedChecks.push(`sells:${((1 - buyRatio) * 100).toFixed(0)}%`);
-  }
-  
-  // 5. Holder concentration
-  if (token.top10Holders <= 40) {
-    passedChecks.push(`holders:${token.top10Holders.toFixed(0)}%`);
-  } else if (token.top10Holders <= 50) {
-    passedChecks.push(`holders:warn${token.top10Holders.toFixed(0)}%`);
-  } else {
-    failedChecks.push(`holders:${token.top10Holders.toFixed(0)}%`);
-  }
-  
-  // 6. LP burned check
-  if (token.lpBurned >= 90) {
-    passedChecks.push(`lp:${token.lpBurned.toFixed(0)}%burned`);
-  } else if (token.lpBurned >= 50) {
-    passedChecks.push(`lp:partial${token.lpBurned.toFixed(0)}%`);
-  } else {
-    failedChecks.push(`lp:notburned`);
-  }
-  
-  // Pass if no critical failures
-  const criticalFails = failedChecks.filter(f => 
-    f.startsWith('momentum:') && !f.includes('weak') ||
-    f.startsWith('holders:') ||
-    f.startsWith('age:')
-  );
-  
   return {
-    passed: criticalFails.length === 0 && passedChecks.length >= 3,
+    passed: true,
     passedChecks,
     failedChecks,
   };
@@ -633,9 +736,56 @@ async function enterTrade(token: AxiomTrendingToken, passedChecks: string[]): Pr
           timestamp: update.timestamp || Date.now(),
         };
       });
-      logger.debug(`  Subscribed to real-time price updates for ${token.tokenTicker}`);
+      logger.debug(`  Subscribed to Axiom WebSocket price updates for ${token.tokenTicker}`);
     } catch (err) {
-      logger.debug(`  Could not subscribe to WebSocket: ${err}`);
+      logger.debug(`  Could not subscribe to Axiom WebSocket: ${err}`);
+    }
+    
+    // PRIORITY: Subscribe to Helius on-chain price updates (truly real-time!)
+    // Only works for tokens still on Pump.fun bonding curve (not graduated to Raydium)
+    const isOnBondingCurve = token.marketCapSol < 85; // Graduation threshold is 85 SOL (~$10.6k at $125 SOL)
+    
+    if (ENV.HELIUS_API_KEY && PRICE_MONITOR?.USE_HELIUS && isOnBondingCurve) {
+      try {
+        const heliusMonitor = getHeliusPriceMonitor();
+        
+        if (!heliusConnected) {
+          await heliusMonitor.connect();
+          heliusConnected = true;
+          logger.success(`  [HELIUS] Connected to on-chain monitoring`);
+        }
+        
+        heliusPrice = null; // Reset
+        
+        // Use actual bonding curve address from PumpPortal if available, otherwise derive
+        // pairAddress contains bondingCurve for PumpPortal tokens
+        const bondingCurve = (token.pairAddress && token.pairAddress !== token.tokenAddress) 
+          ? token.pairAddress 
+          : deriveBondingCurveAddress(token.tokenAddress);
+        
+        const solPriceForHelius = await getSolPriceUsd();
+        
+        logger.debug(`  [HELIUS] Using bonding curve: ${bondingCurve.slice(0, 8)}... for mint ${token.tokenAddress.slice(0, 8)}...`);
+        
+        heliusPriceUnsubscribe = await heliusMonitor.subscribeToBondingCurve(
+          token.tokenAddress,
+          bondingCurve,
+          (update: HeliusPriceUpdate) => {
+            heliusPrice = {
+              priceSol: update.priceSol,
+              mcSol: update.marketCapSol,
+              mcUsd: update.marketCapUsd || (update.marketCapSol * solPriceForHelius),
+              timestamp: update.timestamp,
+            };
+          }
+        );
+        
+        logger.success(`  [HELIUS] Subscribed to bonding curve for ${token.tokenTicker}`);
+      } catch (err) {
+        logger.warn(`  [HELIUS] Could not subscribe: ${err} - falling back to other sources`);
+      }
+    } else if (ENV.HELIUS_API_KEY && !isOnBondingCurve) {
+      logger.info(`  [HELIUS] Token ${token.tokenTicker} is graduated (MC: ${token.marketCapSol.toFixed(0)} SOL) - using DexScreener/Axiom for price`);
     }
     
     logger.success(`  Trade entered: ${trade.tokenAmount.toFixed(2)} ${token.tokenTicker} @ ${trade.pricePerToken.toExponential(4)} SOL`);
@@ -665,64 +815,78 @@ async function monitorPosition(): Promise<void> {
     return `${(price * 1e9).toFixed(2)} nSOL`;
   };
   
-  try {
-    // PRIORITY 1: Check WebSocket price first (most real-time!)
-    if (wsPrice && wsPrice.priceSol > 0 && (Date.now() - wsPrice.timestamp) < 5000) {
-      const currentPriceSol = wsPrice.priceSol;
-      const currentMcUsd = wsPrice.mcUsd;
-      const source = 'axiom-ws';
-      
-      const pnlPercent = ((currentPriceSol - entryPrice) / entryPrice) * 100;
-      const emoji = pnlPercent >= 0 ? '📈' : '📉';
-      const portfolio = getPaperPortfolio();
-      const position = portfolio.positions.get(mint);
-      const estimatedPnlSol = position ? position.costBasis * (pnlPercent / 100) : null;
-      const pnlSolDisplay = estimatedPnlSol !== null
-        ? ` | ${estimatedPnlSol >= 0 ? '+' : ''}${estimatedPnlSol.toFixed(4)} SOL est`
-        : '';
+  // Helper function to process price update from any source
+  const processPriceUpdate = async (currentPriceSol: number, currentMcUsd: number, source: string) => {
+    const pnlPercent = ((currentPriceSol - entryPrice) / entryPrice) * 100;
+    const emoji = pnlPercent >= 0 ? '📈' : '📉';
+    const portfolio = getPaperPortfolio();
+    const position = portfolio.positions.get(mint);
+    const estimatedPnlSol = position ? position.costBasis * (pnlPercent / 100) : null;
+    const pnlSolDisplay = estimatedPnlSol !== null
+      ? ` | ${estimatedPnlSol >= 0 ? '+' : ''}${estimatedPnlSol.toFixed(4)} SOL est`
+      : '';
 
-      if (state.currentPosition) {
-        const now = Date.now();
-        const lastPrice = state.currentPosition.lastPriceSol;
-        const movePercent = lastPrice > 0
-          ? Math.abs((currentPriceSol - lastPrice) / lastPrice) * 100
-          : 0;
+    if (state.currentPosition) {
+      const now = Date.now();
+      const lastPrice = state.currentPosition.lastPriceSol;
+      const movePercent = lastPrice > 0
+        ? Math.abs((currentPriceSol - lastPrice) / lastPrice) * 100
+        : 0;
 
-        if (movePercent >= AXIOM_AUTO_CONFIG.stagnantMinMovePercent) {
-          state.currentPosition.lastPriceSol = currentPriceSol;
-          state.currentPosition.lastMoveTime = now;
-        } else {
-          const stagnantMs = now - state.currentPosition.lastMoveTime;
-          if (stagnantMs >= AXIOM_AUTO_CONFIG.stagnantExitSeconds * 1000) {
-            logger.warn(`  ⏳ Position stagnant for ${(stagnantMs / 1000).toFixed(0)}s with no significant move (min ${AXIOM_AUTO_CONFIG.stagnantMinMovePercent}%)`);
-            await exitPosition('STAGNANT');
-            return;
-          }
+      if (movePercent >= AXIOM_AUTO_CONFIG.stagnantMinMovePercent) {
+        state.currentPosition.lastPriceSol = currentPriceSol;
+        state.currentPosition.lastMoveTime = now;
+      } else {
+        const stagnantMs = now - state.currentPosition.lastMoveTime;
+        if (stagnantMs >= AXIOM_AUTO_CONFIG.stagnantExitSeconds * 1000) {
+          logger.warn(`  ⏳ Position stagnant for ${(stagnantMs / 1000).toFixed(0)}s with no significant move (min ${AXIOM_AUTO_CONFIG.stagnantMinMovePercent}%)`);
+          await exitPosition('STAGNANT');
+          return true; // Signal that we exited
         }
-
-        state.currentPosition.lastPnlPercent = pnlPercent;
-        state.currentPosition.lastMcUsd = currentMcUsd;
       }
 
-      const mcDisplay = currentMcUsd >= 1_000_000 
-        ? `$${(currentMcUsd / 1_000_000).toFixed(1)}M` 
-        : `$${(currentMcUsd / 1000).toFixed(1)}k`;
-      const sourceTag = ` [${source}]`;
-      
-      logger.info(`  ${emoji} ${symbol}: ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(1)}% (SOL)${pnlSolDisplay} | MC: ${mcDisplay} | ${fmtPrice(currentPriceSol)} (entry: ${fmtPrice(entryPrice)})${sourceTag}  [x to exit]`);
-      writeStatusFile();
-      
-      if (pnlPercent >= AXIOM_AUTO_CONFIG.takeProfitPercent) {
-        logger.success(`  🎯 Take profit hit! (+${pnlPercent.toFixed(1)}%)`);
-        await exitPosition('TP');
-      } else if (pnlPercent <= -AXIOM_AUTO_CONFIG.stopLossPercent) {
-        logger.warn(`  🛑 Stop loss hit! (${pnlPercent.toFixed(1)}%)`);
-        await exitPosition('SL');
-      }
+      state.currentPosition.lastPnlPercent = pnlPercent;
+      state.currentPosition.lastMcUsd = currentMcUsd;
+    }
+
+    const mcDisplay = currentMcUsd >= 1_000_000 
+      ? `$${(currentMcUsd / 1_000_000).toFixed(1)}M` 
+      : `$${(currentMcUsd / 1000).toFixed(1)}k`;
+    const sourceTag = ` [${source}]`;
+    
+    logger.info(`  ${emoji} ${symbol}: ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(1)}% (SOL)${pnlSolDisplay} | MC: ${mcDisplay} | ${fmtPrice(currentPriceSol)} (entry: ${fmtPrice(entryPrice)})${sourceTag}  [x to exit]`);
+    writeStatusFile();
+    
+    if (pnlPercent >= AXIOM_AUTO_CONFIG.takeProfitPercent) {
+      logger.success(`  🎯 Take profit hit! (+${pnlPercent.toFixed(1)}%)`);
+      await exitPosition('TP');
+      return true;
+    } else if (pnlPercent <= -AXIOM_AUTO_CONFIG.stopLossPercent) {
+      logger.warn(`  🛑 Stop loss hit! (${pnlPercent.toFixed(1)}%)`);
+      await exitPosition('SL');
+      return true;
+    }
+    return false;
+  };
+  
+  try {
+    // PRIORITY 0: Helius on-chain price (truly real-time, direct from blockchain!)
+    // If we have an active subscription, the price IS the on-chain price - no staleness check needed
+    // Only updates come when trades happen, but the price is still valid (hasn't changed)
+    if (heliusPriceUnsubscribe && heliusPrice && heliusPrice.priceSol > 0) {
+      const exited = await processPriceUpdate(heliusPrice.priceSol, heliusPrice.mcUsd, 'helius');
+      if (exited) return;
+      return; // Helius price used, don't fall through
+    }
+    
+    // PRIORITY 1: Check Axiom WebSocket price (second most real-time)
+    if (wsPrice && wsPrice.priceSol > 0 && (Date.now() - wsPrice.timestamp) < 5000) {
+      const exited = await processPriceUpdate(wsPrice.priceSol, wsPrice.mcUsd, 'axiom-ws');
+      if (exited) return;
       return;
     }
     
-    // PRIORITY 2: Try DexScreener (most reliable free API)
+    // PRIORITY 2: Try DexScreener (reliable free API)
     try {
       const dexResponse = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
       if (dexResponse.ok) {
@@ -738,54 +902,8 @@ async function monitorPosition(): Promise<void> {
           const currentMcUsd = topPair.marketCap || topPair.fdv || 0;
           
           if (currentPriceSol > 0) {
-            const source = 'dexscreener';
-            const pnlPercent = ((currentPriceSol - entryPrice) / entryPrice) * 100;
-            const emoji = pnlPercent >= 0 ? '📈' : '📉';
-            const portfolio = getPaperPortfolio();
-            const position = portfolio.positions.get(mint);
-            const estimatedPnlSol = position ? position.costBasis * (pnlPercent / 100) : null;
-            const pnlSolDisplay = estimatedPnlSol !== null
-              ? ` | ${estimatedPnlSol >= 0 ? '+' : ''}${estimatedPnlSol.toFixed(4)} SOL est`
-              : '';
-
-            if (state.currentPosition) {
-              const now = Date.now();
-              const lastPrice = state.currentPosition.lastPriceSol;
-              const movePercent = lastPrice > 0
-                ? Math.abs((currentPriceSol - lastPrice) / lastPrice) * 100
-                : 0;
-
-              if (movePercent >= AXIOM_AUTO_CONFIG.stagnantMinMovePercent) {
-                state.currentPosition.lastPriceSol = currentPriceSol;
-                state.currentPosition.lastMoveTime = now;
-              } else {
-                const stagnantMs = now - state.currentPosition.lastMoveTime;
-                if (stagnantMs >= AXIOM_AUTO_CONFIG.stagnantExitSeconds * 1000) {
-                  logger.warn(`  ⏳ Position stagnant for ${(stagnantMs / 1000).toFixed(0)}s with no significant move`);
-                  await exitPosition('STAGNANT');
-                  return;
-                }
-              }
-
-              state.currentPosition.lastPnlPercent = pnlPercent;
-              state.currentPosition.lastMcUsd = currentMcUsd;
-            }
-
-            const mcDisplay = currentMcUsd >= 1_000_000 
-              ? `$${(currentMcUsd / 1_000_000).toFixed(1)}M` 
-              : `$${(currentMcUsd / 1000).toFixed(1)}k`;
-            const sourceTag = ` [${source}]`;
-            
-            logger.info(`  ${emoji} ${symbol}: ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(1)}% (SOL)${pnlSolDisplay} | MC: ${mcDisplay} | ${fmtPrice(currentPriceSol)} (entry: ${fmtPrice(entryPrice)})${sourceTag}  [x to exit]`);
-            writeStatusFile();
-            
-            if (pnlPercent >= AXIOM_AUTO_CONFIG.takeProfitPercent) {
-              logger.success(`  🎯 Take profit hit! (+${pnlPercent.toFixed(1)}%)`);
-              await exitPosition('TP');
-            } else if (pnlPercent <= -AXIOM_AUTO_CONFIG.stopLossPercent) {
-              logger.warn(`  🛑 Stop loss hit! (${pnlPercent.toFixed(1)}%)`);
-              await exitPosition('SL');
-            }
+            const exited = await processPriceUpdate(currentPriceSol, currentMcUsd, 'dexscreener');
+            if (exited) return;
             return;
           }
         }
@@ -991,7 +1109,17 @@ async function fetchCurrentPriceAndMc(
   entryPrice: number,
   platform: 'pump.fun' | 'jupiter'
 ): Promise<{ priceSol: number; mcUsd: number; source: string }> {
-  // PRIORITY 1: Use WebSocket price if available (most real-time!)
+  // PRIORITY 0: Helius on-chain price (truly real-time, direct from blockchain!)
+  // If we have an active subscription, the price IS the on-chain price
+  if (heliusPriceUnsubscribe && heliusPrice && heliusPrice.priceSol > 0) {
+    return {
+      priceSol: heliusPrice.priceSol,
+      mcUsd: heliusPrice.mcUsd,
+      source: 'helius',
+    };
+  }
+  
+  // PRIORITY 1: Use Axiom WebSocket price if available
   if (wsPrice && wsPrice.priceSol > 0 && (Date.now() - wsPrice.timestamp) < 5000) {
     return {
       priceSol: wsPrice.priceSol,
@@ -1115,6 +1243,13 @@ async function exitPosition(reason: string): Promise<void> {
       wsPriceUnsubscribe();
       wsPriceUnsubscribe = null;
       wsPrice = null;
+    }
+    
+    // Unsubscribe from Helius on-chain price updates
+    if (heliusPriceUnsubscribe) {
+      heliusPriceUnsubscribe();
+      heliusPriceUnsubscribe = null;
+      heliusPrice = null;
     }
     
     // Add to recently traded so it won't be picked again

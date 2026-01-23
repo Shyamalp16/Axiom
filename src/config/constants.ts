@@ -246,6 +246,26 @@ export const PAPER_TRADING = {
 } as const;
 
 // ============================================
+// PRICE MONITORING SETTINGS
+// ============================================
+
+export const PRICE_MONITOR = {
+  // Use Helius WebSocket for on-chain price monitoring (truly real-time)
+  // Requires HELIUS_API_KEY in environment
+  USE_HELIUS: true,
+  
+  // Use both Helius and PumpPortal simultaneously
+  // Helius for price, PumpPortal for trade metadata
+  DUAL_SOURCE: false,
+  
+  // Fallback to PumpPortal if Helius fails
+  FALLBACK_TO_PUMPPORTAL: true,
+  
+  // Maximum time (ms) without price update before considering stale
+  STALE_PRICE_THRESHOLD_MS: 30000, // 30 seconds
+} as const;
+
+// ============================================
 // TECHNICAL DEFAULTS
 // ============================================
 

@@ -806,13 +806,16 @@ export async function connectAxiomWebSocket(
     throw new Error('Axiom Trade not authenticated');
   }
   
+  // Get fresh access token (will refresh if expired)
+  const token = await getAccessToken();
+  
   return new Promise((resolve, reject) => {
     const wsUrl = AXIOM_WS_CLUSTERS[region];
     
     try {
       axiomWs = new WebSocket(wsUrl, {
         headers: {
-          'Cookie': `auth-access-token=${accessToken}; auth-refresh-token=${refreshToken}`,
+          'Cookie': `auth-access-token=${token}; auth-refresh-token=${refreshToken}`,
           'Origin': 'https://axiom.trade',
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         },

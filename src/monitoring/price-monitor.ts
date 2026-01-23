@@ -1,22 +1,31 @@
 /**
  * PRICE MONITOR - High-Frequency WebSocket-Based Price Tracking
  * 
- * Monitors token prices via PumpPortal WebSocket trade events
- * Checks TP/SL conditions on EVERY trade event (not on a timer)
+ * Monitors token prices via:
+ * 1. Helius WebSocket (PRIMARY) - Direct on-chain account subscriptions
+ * 2. PumpPortal WebSocket (FALLBACK) - Trade event streaming
  * 
- * Data source: PumpPortal subscribeTokenTrades()
- * Price calculation: vSolInBondingCurve / vTokensInBondingCurve
+ * Helius provides truly real-time updates by monitoring bonding curve
+ * account changes directly on-chain. Falls back to PumpPortal if
+ * Helius is unavailable.
+ * 
+ * Checks TP/SL conditions on EVERY price update (not on a timer)
  */
 
 import { LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { Position, OrderReason } from '../types/index.js';
-import { STOP_LOSS, TAKE_PROFIT, TIME_KILL_SWITCH, PAPER_TRADING } from '../config/index.js';
+import { STOP_LOSS, TAKE_PROFIT, TIME_KILL_SWITCH, PAPER_TRADING, PRICE_MONITOR } from '../config/index.js';
 import { subscribeTokenTrades, PumpPortalTrade, getSolPrice } from '../api/pump-portal.js';
 import { updatePosition, closePosition, getPosition } from '../trading/position-manager.js';
 import { paperSell, getPaperPortfolio } from '../trading/paper-trader.js';
 import { candidateQueue } from '../discovery/candidate-queue.js';
 import { sellOnPumpFun } from '../api/pump-fun.js';
 import { executeSell } from '../trading/executor.js';
+import { 
+  getHeliusPriceMonitor, 
+  HeliusPriceUpdate, 
+  deriveBondingCurveAddress 
+} from './helius-price-monitor.js';
 import logger from '../utils/logger.js';
 
 // Price data structure
@@ -49,14 +58,20 @@ export interface PriceMonitorCallbacks {
 // Monitored position state
 interface MonitoredPosition {
   position: Position;
-  unsubscribe: () => void;
+  unsubscribeHelius: (() => void) | null;
+  unsubscribePumpPortal: (() => void) | null;
   lastPriceUpdate: number;
   lastHigherHighTime: number;
+  priceSource: 'helius' | 'pumpportal' | 'unknown';
+  bondingCurve: string | null;
 }
 
 /**
  * Price Monitor Class
  * Monitors positions via WebSocket and executes TP/SL automatically
+ * 
+ * Uses Helius on-chain monitoring as primary source (if available)
+ * Falls back to PumpPortal trade events if Helius unavailable
  */
 export class PriceMonitor {
   private monitored: Map<string, MonitoredPosition> = new Map();
@@ -64,38 +79,92 @@ export class PriceMonitor {
   private solPrice: number = 150; // Cached SOL price
   private solPriceLastUpdate: number = 0;
   private isProcessingExit: Map<string, boolean> = new Map(); // Prevent duplicate exits
+  private useHelius: boolean = true; // Try Helius first
+  private heliusAvailable: boolean | null = null; // null = not checked yet
   
   constructor(callbacks: PriceMonitorCallbacks = {}) {
     this.callbacks = callbacks;
     this.refreshSolPrice();
+    
+    // Check if Helius should be used based on config
+    // Cast to boolean to satisfy TypeScript (config value is `as const`)
+    this.useHelius = Boolean(PRICE_MONITOR?.USE_HELIUS);
   }
   
   /**
    * Start monitoring a position
    */
-  startMonitoring(mint: string, position: Position): void {
+  async startMonitoring(mint: string, position: Position, bondingCurve?: string): Promise<void> {
     if (this.monitored.has(mint)) {
       logger.debug(`Already monitoring ${mint.slice(0, 8)}...`);
       return;
     }
     
     logger.info(`Starting price monitor for ${position.symbol} (${mint.slice(0, 8)}...)`);
-    logger.debug(`Subscribing to trade events for mint: ${mint}`);
     
-    // Subscribe to trade events for this token
-    const unsubscribe = subscribeTokenTrades([mint], (trade: PumpPortalTrade) => {
-      logger.debug(`Trade event received for ${position.symbol}: ${trade.txType} ${trade.tokenAmount} tokens`);
-      this.handleTradeEvent(mint, trade);
-    });
+    // Derive bonding curve if not provided
+    const bondingCurveAddress = bondingCurve || deriveBondingCurveAddress(mint);
     
-    this.monitored.set(mint, {
+    const monitoredPosition: MonitoredPosition = {
       position,
-      unsubscribe,
+      unsubscribeHelius: null,
+      unsubscribePumpPortal: null,
       lastPriceUpdate: Date.now(),
       lastHigherHighTime: Date.now(),
+      priceSource: 'unknown',
+      bondingCurve: bondingCurveAddress,
+    };
+    
+    this.monitored.set(mint, monitoredPosition);
+    
+    // Try Helius first (on-chain monitoring)
+    let heliusSuccess = false;
+    if (this.useHelius && bondingCurveAddress) {
+      try {
+        const heliusMonitor = getHeliusPriceMonitor();
+        
+        // Connect if not already connected
+        if (!heliusMonitor.connected) {
+          await heliusMonitor.connect();
+        }
+        
+        // Subscribe to bonding curve account
+        const unsubscribe = await heliusMonitor.subscribeToBondingCurve(
+          mint,
+          bondingCurveAddress,
+          (update: HeliusPriceUpdate) => {
+            this.handleHeliusPriceUpdate(mint, update);
+          }
+        );
+        
+        monitoredPosition.unsubscribeHelius = unsubscribe;
+        monitoredPosition.priceSource = 'helius';
+        heliusSuccess = true;
+        this.heliusAvailable = true;
+        
+        logger.success(`[HELIUS] On-chain price monitor active for ${position.symbol}`);
+        
+      } catch (error) {
+        logger.warn(`Helius monitoring failed, falling back to PumpPortal: ${error}`);
+        this.heliusAvailable = false;
+      }
+    }
+    
+    // Always set up PumpPortal as fallback/supplement
+    // Even with Helius, PumpPortal provides useful trade metadata
+    const unsubscribePumpPortal = subscribeTokenTrades([mint], (trade: PumpPortalTrade) => {
+      // Only process if Helius isn't active, or if we want both
+      if (!heliusSuccess || PRICE_MONITOR?.DUAL_SOURCE) {
+        this.handleTradeEvent(mint, trade);
+      }
     });
     
-    logger.success(`Price monitor active for ${position.symbol}`);
+    monitoredPosition.unsubscribePumpPortal = unsubscribePumpPortal;
+    
+    if (!heliusSuccess) {
+      monitoredPosition.priceSource = 'pumpportal';
+      logger.success(`[PumpPortal] Price monitor active for ${position.symbol}`);
+    }
   }
   
   /**
@@ -104,11 +173,89 @@ export class PriceMonitor {
   stopMonitoring(mint: string): void {
     const monitored = this.monitored.get(mint);
     if (monitored) {
-      monitored.unsubscribe();
+      // Unsubscribe from both sources
+      if (monitored.unsubscribeHelius) {
+        monitored.unsubscribeHelius();
+      }
+      if (monitored.unsubscribePumpPortal) {
+        monitored.unsubscribePumpPortal();
+      }
+      
       this.monitored.delete(mint);
       this.isProcessingExit.delete(mint);
-      logger.info(`Stopped monitoring ${mint.slice(0, 8)}...`);
+      logger.info(`Stopped monitoring ${mint.slice(0, 8)}... (source: ${monitored.priceSource})`);
     }
+  }
+  
+  /**
+   * Handle Helius on-chain price update
+   * This is the PRIMARY price source when available
+   */
+  private async handleHeliusPriceUpdate(mint: string, update: HeliusPriceUpdate): Promise<void> {
+    const monitored = this.monitored.get(mint);
+    if (!monitored) {
+      return;
+    }
+    
+    // Get latest position state
+    let position: Position;
+    
+    if (PAPER_TRADING.ENABLED) {
+      const portfolio = getPaperPortfolio();
+      const paperPos = portfolio.positions.get(mint);
+      if (!paperPos) {
+        logger.warn(`📝 [PAPER] Position not found in portfolio for ${mint.slice(0, 8)}... - stopping monitor`);
+        this.stopMonitoring(mint);
+        return;
+      }
+      position = monitored.position;
+    } else {
+      const realPosition = getPosition(monitored.position.id);
+      if (!realPosition || realPosition.status === 'closed') {
+        this.stopMonitoring(mint);
+        return;
+      }
+      position = realPosition;
+    }
+    
+    const priceSol = update.priceSol;
+    
+    // Create price data for callbacks
+    const priceData: PriceData = {
+      priceSol,
+      priceUsd: update.priceUsd,
+      marketCapSol: update.marketCapSol,
+      marketCapUsd: update.marketCapUsd,
+      timestamp: update.timestamp,
+      source: 'websocket', // Kept for compatibility
+    };
+    
+    // Update position state
+    position.currentPrice = priceSol;
+    position.highestPrice = Math.max(position.highestPrice, priceSol);
+    
+    // Track higher high for time stop
+    if (priceSol > monitored.position.highestPrice) {
+      monitored.lastHigherHighTime = Date.now();
+    }
+    
+    // Calculate PnL
+    const pnlPercent = ((priceSol - position.entryPrice) / position.entryPrice) * 100;
+    position.unrealizedPnlPercent = pnlPercent;
+    position.unrealizedPnl = position.costBasis * (pnlPercent / 100);
+    
+    // Update position in manager
+    updatePosition(position.id, priceSol);
+    
+    // Update monitored state
+    monitored.position = position;
+    monitored.lastPriceUpdate = Date.now();
+    
+    // Callback for price update
+    this.callbacks.onPriceUpdate?.(mint, priceData, position);
+    
+    // Check TP/SL conditions
+    await this.checkTPSLAndExecute(mint, position, monitored.lastHigherHighTime);
   }
   
   /**
@@ -119,6 +266,20 @@ export class PriceMonitor {
       this.stopMonitoring(mint);
     }
     logger.info('All price monitors stopped');
+  }
+  
+  /**
+   * Get the current price source being used
+   */
+  getPriceSource(mint: string): 'helius' | 'pumpportal' | 'unknown' {
+    return this.monitored.get(mint)?.priceSource || 'unknown';
+  }
+  
+  /**
+   * Check if Helius is available
+   */
+  isHeliusAvailable(): boolean {
+    return this.heliusAvailable === true;
   }
   
   /**
@@ -445,6 +606,7 @@ export class PriceMonitor {
     pnlPercent: number;
     tpLevelsHit: number[];
     lastUpdate: number;
+    priceSource: 'helius' | 'pumpportal' | 'unknown';
   }> {
     const status: Array<{
       mint: string;
@@ -452,6 +614,7 @@ export class PriceMonitor {
       pnlPercent: number;
       tpLevelsHit: number[];
       lastUpdate: number;
+      priceSource: 'helius' | 'pumpportal' | 'unknown';
     }> = [];
     
     for (const [mint, monitored] of this.monitored) {
@@ -461,6 +624,7 @@ export class PriceMonitor {
         pnlPercent: monitored.position.unrealizedPnlPercent,
         tpLevelsHit: monitored.position.tpLevelsHit,
         lastUpdate: monitored.lastPriceUpdate,
+        priceSource: monitored.priceSource,
       });
     }
     

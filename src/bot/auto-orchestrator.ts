@@ -216,8 +216,8 @@ export class AutoTradingBot {
             const result = await this.pipeline.process(candidate);
             
             if (result.entered && result.position) {
-              // 3. Start price monitoring for the new position
-              this.priceMonitor.startMonitoring(candidate.mint, result.position);
+              // 3. Start price monitoring for the new position (async - uses Helius on-chain if available)
+              await this.priceMonitor.startMonitoring(candidate.mint, result.position);
               
               // 4. Stop discovery while position is open
               logger.info('📝 Position entered - stopping discovery to focus on monitoring');
@@ -340,7 +340,7 @@ export class AutoTradingBot {
             status: 'active',
           };
           
-          this.priceMonitor.startMonitoring(mint, position);
+          await this.priceMonitor.startMonitoring(mint, position);
           logger.info(`📝 Monitoring restored for ${paperPos.symbol}`);
         }
         
@@ -357,7 +357,7 @@ export class AutoTradingBot {
       logger.info(`Restoring monitoring for ${positions.length} existing position(s)...`);
       
       for (const position of positions) {
-        this.priceMonitor.startMonitoring(position.mint, position);
+        await this.priceMonitor.startMonitoring(position.mint, position);
       }
       
       return true;
