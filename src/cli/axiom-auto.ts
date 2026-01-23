@@ -1393,13 +1393,16 @@ async function fetchCurrentPriceAndMc(
   return { priceSol: entryPrice, mcUsd: 0, source: 'fallback' };
 }
 
-async function exitPosition(reason: string): Promise<void> {
+async function exitPosition(reason: string, exitPrice?: number): Promise<void> {
   if (!state.currentPosition) return;
   
   const { mint, symbol } = state.currentPosition;
   
+  // Use Helius price if available and no override provided
+  const priceToUse = exitPrice || (heliusPrice?.priceSol && heliusPrice.priceSol > 0 ? heliusPrice.priceSol : undefined);
+  
   try {
-    const trade = await paperSell(mint, symbol, 100, reason);
+    const trade = await paperSell(mint, symbol, 100, reason, priceToUse);
     
     if (trade) {
       const pnlEmoji = (trade.pnl || 0) >= 0 ? '📈' : '📉';

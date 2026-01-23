@@ -344,12 +344,14 @@ export async function paperBuy(
 
 /**
  * Simulate a sell order
+ * @param overridePrice - Optional price to use instead of fetching (e.g., from Helius)
  */
 export async function paperSell(
   mint: string,
   symbol: string,
   percentToSell: number = 100,
-  reason: string = 'manual'
+  reason: string = 'manual',
+  overridePrice?: number
 ): Promise<PaperTrade | null> {
   const position = portfolio.positions.get(mint);
   
@@ -377,7 +379,15 @@ export async function paperSell(
   // Use lower slippage for paper trading (realistic price impact only)
   const sellSlippage = SLIPPAGE.PAPER_SELL_SLIPPAGE_PERCENT;
   
-  if (isPump && pumpToken) {
+  // If override price is provided (e.g., from Helius real-time), use it
+  if (overridePrice && overridePrice > 0) {
+    platform = isPump ? 'pump.fun' : 'jupiter';
+    pricePerToken = overridePrice;
+    logger.info(`📝 [PAPER] Using override price: ${pricePerToken.toExponential(4)} SOL/token`);
+    solReceived = (tokenAmount * pricePerToken) * (1 - sellSlippage / 100);
+    logger.info(`📝 [PAPER] Sell: ${tokenAmount.toFixed(2)} tokens × ${pricePerToken.toExponential(4)} SOL = ${(tokenAmount * pricePerToken).toFixed(6)} SOL`);
+    logger.info(`📝 [PAPER] After ${sellSlippage}% slippage: ${solReceived.toFixed(6)} SOL`);
+  } else if (isPump && pumpToken) {
     platform = 'pump.fun';
     
     // Log current market data
