@@ -14,7 +14,7 @@ import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { format } from 'date-fns';
 import { fetchPumpFunToken, calculatePumpFunBuyQuote, calculatePumpFunSellQuote } from '../api/pump-fun.js';
-import { fetchMarketData, fetchSolPrice } from '../api/data-providers.js';
+import { fetchSolPrice } from '../api/data-providers.js';
 import { getAxiomBatchPrices, isAxiomAuthenticated } from '../api/axiom-trade.js';
 import { SLIPPAGE, FEES_EXECUTION, POSITION_SIZING } from '../config/index.js';
 import logger from '../utils/logger.js';
@@ -41,7 +41,8 @@ async function getCachedSolPriceUsd(): Promise<number> {
 }
 
 /**
- * Fetch price from Axiom (for graduated/DEX tokens) with DexScreener fallback
+ * Fetch price for graduated/DEX tokens
+ * Priority: Axiom → pump.fun REST API → fallback
  */
 async function fetchAxiomPrice(mint: string): Promise<{ priceSol: number; source: string }> {
   // Try Axiom first if authenticated
@@ -62,10 +63,20 @@ async function fetchAxiomPrice(mint: string): Promise<{ priceSol: number; source
     }
   }
   
-  // Fallback to DexScreener
-  const marketData = await fetchMarketData(mint);
-  logger.debug(`📝 [PAPER] DexScreener price for ${mint.slice(0, 8)}...: ${marketData.priceSol.toExponential(4)} SOL`);
-  return { priceSol: marketData.priceSol, source: 'dexscreener' };
+  // Fallback to pump.fun REST API (works for graduated tokens too)
+  try {
+    const pumpToken = await fetchPumpFunToken(mint);
+    if (pumpToken && pumpToken.priceSol > 0) {
+      logger.debug(`📝 [PAPER] Pump.fun price for ${mint.slice(0, 8)}...: ${pumpToken.priceSol.toExponential(4)} SOL`);
+      return { priceSol: pumpToken.priceSol, source: 'pump.fun' };
+    }
+  } catch (err) {
+    logger.debug(`📝 [PAPER] Pump.fun price fetch failed: ${err}`);
+  }
+  
+  // Final fallback - return 0 and let caller handle gracefully
+  logger.warn(`📝 [PAPER] Could not fetch price for ${mint.slice(0, 8)}... - no valid price source`);
+  return { priceSol: 0, source: 'none' };
 }
 
 const DATA_DIR = './data';
@@ -279,6 +290,12 @@ export async function paperBuy(
     // Jupiter/DEX - use Axiom pricing for consistency
     platform = 'jupiter';
     const { priceSol, source } = await fetchAxiomPrice(mint);
+    
+    // Validate price - must be > 0 and not unreasonably large
+    if (priceSol <= 0 || !isFinite(priceSol)) {
+      throw new Error(`No valid price available for ${symbol} (${mint.slice(0, 8)}...) - cannot execute paper trade`);
+    }
+    
     pricePerToken = priceSol;
     tokenAmount = (solAmount / pricePerToken) * (1 - buySlippage / 100);
     logger.debug(`📝 [PAPER] BUY price source: ${source}`);
@@ -439,7 +456,16 @@ export async function paperSell(
     // Jupiter/DEX - use Axiom pricing for consistency
     platform = 'jupiter';
     const { priceSol, source } = await fetchAxiomPrice(mint);
-    pricePerToken = priceSol;
+    
+    // Validate price - must be > 0 and finite
+    if (priceSol <= 0 || !isFinite(priceSol)) {
+      // Fall back to entry price for sells if no current price available
+      logger.warn(`📝 [PAPER] No valid market price for ${symbol} - using entry price for sell`);
+      pricePerToken = position.avgEntryPrice;
+    } else {
+      pricePerToken = priceSol;
+    }
+    
     solReceived = (tokenAmount * pricePerToken) * (1 - sellSlippage / 100);
     logger.debug(`📝 [PAPER] SELL price source: ${source}`);
   }

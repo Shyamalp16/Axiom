@@ -334,35 +334,11 @@ async function startBot(): Promise<void> {
       const mcDisplay = estimatedEntryMcSol > 0 ? `~$${(estimatedEntryMcSol * 150 / 1000).toFixed(0)}k MC` : 'MC unknown';
       logger.info(`📝 Existing position: ${pos.symbol} @ ${pos.avgEntryPrice.toExponential(4)} SOL (${inferredPlatform}, ${mcDisplay})`);
       
-      // Set up Helius subscription for existing bonding curve position
-      if (estimatedEntryMcSol > 0 && estimatedEntryMcSol < 85) {
-        try {
-          const helius = getHeliusPriceMonitor();
-          await helius.connect();
-          
-          // Use pairAddress as bonding curve if available, otherwise derive it
-          const bondingCurve = pairAddress || deriveBondingCurveAddress(mint);
-          logger.info(`  [HELIUS] Subscribing to existing position: ${bondingCurve.slice(0, 8)}...`);
-          
-          heliusPriceUnsubscribe = await helius.subscribeToBondingCurve(
-            mint,
-            bondingCurve,
-            (update: HeliusPriceUpdate) => {
-              heliusPrice = {
-                priceSol: update.priceSol,
-                mcSol: update.marketCapSol,
-                mcUsd: update.marketCapUsd,
-                timestamp: Date.now(),
-              };
-              logger.debug(`  [HELIUS] Price update: ${update.priceSol.toExponential(4)} SOL (MC: ${update.marketCapSol.toFixed(1)} SOL)`);
-            }
-          );
-          logger.success(`  [HELIUS] Subscribed to ${pos.symbol} for real-time price updates`);
-        } catch (heliusError) {
-          logger.warn(`  [HELIUS] Could not subscribe to existing position: ${heliusError}`);
-        }
-      } else if (estimatedEntryMcSol >= 85) {
-        logger.info(`  [HELIUS] Token ${pos.symbol} is graduated (MC: ${estimatedEntryMcSol.toFixed(0)} SOL) - using DexScreener/Axiom for price`);
+      // For ALL pump.fun tokens (bonding curve AND graduated): Use pump.fun REST API
+      // The pump.fun API works for both and is more reliable than Helius for price/MC data
+      if (inferredPlatform === 'pump.fun') {
+        logger.info(`  [PRICE] Token ${pos.symbol} - using pump.fun REST API for price monitoring`);
+        // No Helius subscription needed - pump.fun REST API will be used in monitorPosition()
       }
     }
     
@@ -467,6 +443,7 @@ async function discoverAndTrade(): Promise<void> {
         const result = passesPumpPortalFilter(pumpToken);
         if (result.passed) {
           // Convert to AxiomTrendingToken format
+          // Mark graduated tokens with 'Raydium AMM' protocol so they're handled correctly
           const token: AxiomTrendingToken = {
             pairAddress: pumpToken.bondingCurve || pumpToken.mint,
             tokenAddress: pumpToken.mint,
@@ -474,7 +451,7 @@ async function discoverAndTrade(): Promise<void> {
             tokenTicker: pumpToken.symbol,
             tokenImage: pumpToken.imageUri,
             tokenDecimals: 6,
-            protocol: 'Pump Fun',
+            protocol: pumpToken.isGraduated ? 'Raydium AMM' : 'Pump Fun',
             prevMarketCapSol: pumpToken.marketCapSol,
             marketCapSol: pumpToken.marketCapSol,
             marketCapPercentChange: 0,
@@ -784,51 +761,14 @@ async function enterTrade(token: AxiomTrendingToken, passedChecks: string[]): Pr
       logger.debug(`  Could not subscribe to Axiom WebSocket: ${err}`);
     }
     
-    // PRIORITY: Subscribe to Helius on-chain price updates (truly real-time!)
-    // Only works for tokens still on Pump.fun bonding curve (not graduated to Raydium)
-    const isOnBondingCurve = token.marketCapSol < 85; // Graduation threshold is 85 SOL (~$10.6k at $125 SOL)
+    // For ALL pump.fun tokens (bonding curve AND graduated): Use pump.fun REST API
+    // The pump.fun API works for both and is more reliable than Helius for price/MC data
+    const protocol = token.protocol?.toLowerCase() || '';
+    const isPumpFunToken = protocol.includes('pump') || protocol.includes('raydium');
     
-    if (ENV.HELIUS_API_KEY && PRICE_MONITOR?.USE_HELIUS && isOnBondingCurve) {
-      try {
-        const heliusMonitor = getHeliusPriceMonitor();
-        
-        if (!heliusConnected) {
-          await heliusMonitor.connect();
-          heliusConnected = true;
-          logger.success(`  [HELIUS] Connected to on-chain monitoring`);
-        }
-        
-        heliusPrice = null; // Reset
-        
-        // Use actual bonding curve address from PumpPortal if available, otherwise derive
-        // pairAddress contains bondingCurve for PumpPortal tokens
-        const bondingCurve = (token.pairAddress && token.pairAddress !== token.tokenAddress) 
-          ? token.pairAddress 
-          : deriveBondingCurveAddress(token.tokenAddress);
-        
-        const solPriceForHelius = await getSolPriceUsd();
-        
-        logger.debug(`  [HELIUS] Using bonding curve: ${bondingCurve.slice(0, 8)}... for mint ${token.tokenAddress.slice(0, 8)}...`);
-        
-        heliusPriceUnsubscribe = await heliusMonitor.subscribeToBondingCurve(
-          token.tokenAddress,
-          bondingCurve,
-          (update: HeliusPriceUpdate) => {
-            heliusPrice = {
-              priceSol: update.priceSol,
-              mcSol: update.marketCapSol,
-              mcUsd: update.marketCapUsd || (update.marketCapSol * solPriceForHelius),
-              timestamp: update.timestamp,
-            };
-          }
-        );
-        
-        logger.success(`  [HELIUS] Subscribed to bonding curve for ${token.tokenTicker}`);
-      } catch (err) {
-        logger.warn(`  [HELIUS] Could not subscribe: ${err} - falling back to other sources`);
-      }
-    } else if (ENV.HELIUS_API_KEY && !isOnBondingCurve) {
-      logger.info(`  [HELIUS] Token ${token.tokenTicker} is graduated (MC: ${token.marketCapSol.toFixed(0)} SOL) - using DexScreener/Axiom for price`);
+    if (isPumpFunToken) {
+      logger.info(`  [PRICE] Token ${token.tokenTicker} (protocol: ${token.protocol}) - using pump.fun REST API`);
+      // No Helius subscription needed - pump.fun REST API will be used in monitorPosition()
     }
     
     logger.success(`  Trade entered: ${trade.tokenAmount.toFixed(2)} ${token.tokenTicker} @ ${trade.pricePerToken.toExponential(4)} SOL`);
@@ -882,31 +822,32 @@ async function handleManualEntry(mint: string): Promise<void> {
       logger.info(`  Graduated: ${pumpToken.isGraduated ? 'YES' : 'NO'}`);
       
       // Convert to AxiomTrendingToken format
-      const token: AxiomTrendingToken = {
-        pairAddress: pumpToken.bondingCurve || pumpToken.mint,
-        tokenAddress: pumpToken.mint,
-        tokenName: pumpToken.name,
-        tokenTicker: pumpToken.symbol,
-        tokenImage: pumpToken.imageUri,
-        tokenDecimals: 6,
-        protocol: 'Pump Fun',
-        prevMarketCapSol: pumpToken.marketCapSol,
-        marketCapSol: pumpToken.marketCapSol,
-        marketCapPercentChange: 0,
-        liquiditySol: pumpToken.virtualSolReserves,
-        liquidityToken: pumpToken.virtualTokenReserves,
-        volumeSol: 0,
-        buyCount: pumpToken.tradeCount,
-        sellCount: 0,
-        top10Holders: 0,
-        lpBurned: 0,
-        mintAuthority: null,
-        freezeAuthority: null,
-        dexPaid: false,
-        createdAt: new Date(pumpToken.createdTimestamp).toISOString(),
-        supply: 1_000_000_000,
-        userCount: 0,
-      };
+        // Mark graduated tokens with 'Raydium AMM' protocol so they're handled correctly
+        const token: AxiomTrendingToken = {
+          pairAddress: pumpToken.bondingCurve || pumpToken.mint,
+          tokenAddress: pumpToken.mint,
+          tokenName: pumpToken.name,
+          tokenTicker: pumpToken.symbol,
+          tokenImage: pumpToken.imageUri,
+          tokenDecimals: 6,
+          protocol: pumpToken.isGraduated ? 'Raydium AMM' : 'Pump Fun',
+          prevMarketCapSol: pumpToken.marketCapSol,
+          marketCapSol: pumpToken.marketCapSol,
+          marketCapPercentChange: 0,
+          liquiditySol: pumpToken.virtualSolReserves,
+          liquidityToken: pumpToken.virtualTokenReserves,
+          volumeSol: 0,
+          buyCount: pumpToken.tradeCount,
+          sellCount: 0,
+          top10Holders: 0,
+          lpBurned: 0,
+          mintAuthority: null,
+          freezeAuthority: null,
+          dexPaid: false,
+          createdAt: new Date(pumpToken.createdTimestamp).toISOString(),
+          supply: 1_000_000_000,
+          userCount: 0,
+        };
       
       // Enter the trade
       await enterTrade(token, ['MANUAL_ENTRY']);
@@ -1033,40 +974,25 @@ async function monitorPosition(): Promise<void> {
       return;
     }
     
-    // PRIORITY 2: Try DexScreener (reliable free API)
-    try {
-      const dexResponse = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
-      if (dexResponse.ok) {
-        const dexData = await dexResponse.json() as any;
-        const pairs = dexData?.pairs || [];
-        if (pairs.length > 0) {
-          const topPair = pairs.sort((a: any, b: any) => 
-            (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0)
-          )[0];
-          const priceUsd = parseFloat(topPair.priceUsd || '0');
-          const solPriceUsd = await getSolPriceUsd();
-          const currentPriceSol = priceUsd / solPriceUsd;
-          const currentMcUsd = topPair.marketCap || topPair.fdv || 0;
-          
-          if (currentPriceSol > 0) {
-            // Sanity check: reject prices that are wildly different from entry
-            // A 5x move in seconds is almost certainly bad data
-            const priceRatio = currentPriceSol / entryPrice;
-            if (priceRatio > 5 || priceRatio < 0.2) {
-              logger.warn(`  ⚠️ DexScreener price looks wrong: ${(currentPriceSol * 1e9).toFixed(2)} nSOL vs entry ${(entryPrice * 1e9).toFixed(2)} nSOL (${((priceRatio - 1) * 100).toFixed(0)}%) - skipping`);
-            } else {
-              const exited = await processPriceUpdate(currentPriceSol, currentMcUsd, 'dexscreener');
-              if (exited) return;
-              return;
-            }
-          }
+    // PRIORITY 2: For ALL pump.fun tokens (bonding curve AND graduated), use pump.fun REST API
+    // Check if mint ends with 'pump' - this works regardless of the platform field
+    const isPumpFunMint = mint.toLowerCase().endsWith('pump');
+    if (isPumpFunMint) {
+      try {
+        const pumpToken = await fetchPumpFunTokenLive(mint);
+        if (pumpToken && pumpToken.priceSol > 0) {
+          const exited = await processPriceUpdate(pumpToken.priceSol, pumpToken.marketCapUsd || 0, 'pump.fun');
+          if (exited) return;
+          return;
+        } else {
+          logger.debug(`Pump.fun returned no price for ${mint.slice(0, 8)}...`);
         }
+      } catch (err) {
+        logger.debug(`Pump.fun REST API failed: ${err}`);
       }
-    } catch (err) {
-      logger.debug(`DexScreener failed: ${err}`);
     }
     
-    // PRIORITY 4: Fetch current data from Axiom trending (last resort, updates every ~20s)
+    // PRIORITY 3: Fetch current data from Axiom trending (last resort, updates every ~20s)
     const trending = await getAxiomTrending(AXIOM_AUTO_CONFIG.timePeriod);
     const token = trending.find(t => t.tokenAddress === mint);
     
@@ -1299,17 +1225,27 @@ async function fetchCurrentPriceAndMc(
     };
   }
   
-  // For pump.fun tokens (not graduated), use LIVE fetch (bypasses all caching)
-  if (platform === 'pump.fun') {
-    const pumpToken = await fetchPumpFunTokenLive(mint);
-    if (pumpToken && !pumpToken.isGraduated && pumpToken.priceSol > 0) {
-      return {
-        priceSol: pumpToken.priceSol,
-        mcUsd: pumpToken.marketCapUsd || 0,
-        source: 'pump.fun',
-      };
+  // For ALL pump.fun tokens (bonding curve AND graduated), use LIVE fetch
+  // Check if mint ends with 'pump' - this works regardless of the platform field
+  const isPumpFunMint = mint.toLowerCase().endsWith('pump');
+  if (isPumpFunMint) {
+    try {
+      const pumpToken = await fetchPumpFunTokenLive(mint);
+      if (pumpToken && pumpToken.priceSol > 0) {
+        return {
+          priceSol: pumpToken.priceSol,
+          mcUsd: pumpToken.marketCapUsd || 0,
+          source: 'pump.fun',
+        };
+      } else if (pumpToken) {
+        logger.debug(`Pump.fun token ${mint.slice(0, 8)}... has 0 price`);
+      } else {
+        logger.debug(`Pump.fun token ${mint.slice(0, 8)}... not found`);
+      }
+    } catch (err) {
+      logger.debug(`Pump.fun LIVE fetch failed: ${err}`);
     }
-    // If graduated, fall through to Axiom
+    // Fall through to other sources
   }
 
   // PRIORITY 2: Try Axiom chart API (1s candles for most real-time data)
@@ -1371,25 +1307,7 @@ async function fetchCurrentPriceAndMc(
     logger.debug(`Axiom batch-prices failed for ${mint.slice(0, 8)}...: ${err}`);
   }
 
-  // Fallback to DexScreener if Axiom fails
-  try {
-    const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
-    if (response.ok) {
-      const data = await response.json() as any;
-      const pairs = data?.pairs || [];
-      if (pairs.length > 0) {
-        const topPair = pairs.sort((a: any, b: any) =>
-          (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0)
-        )[0];
-        const priceSol = parseFloat(topPair.priceNative) || entryPrice;
-        const mcUsd = topPair.marketCap || topPair.fdv || 0;
-        return { priceSol, mcUsd, source: 'dexscreener' };
-      }
-    }
-  } catch {
-    // Keep entry price as fallback
-  }
-
+  // Final fallback: use entry price (no DexScreener)
   return { priceSol: entryPrice, mcUsd: 0, source: 'fallback' };
 }
 
@@ -1563,6 +1481,7 @@ async function shutdown(): Promise<void> {
 function displayConfig(): void {
   logger.box('Axiom Auto-Trader Config', [
     `Mode: 📝 PAPER TRADING (Axiom Data)`,
+    `Price source: pump.fun REST API (all pump.fun tokens)`,
     `Poll interval: ${AXIOM_AUTO_CONFIG.pollIntervalMs / 1000}s`,
     `Time period: ${AXIOM_AUTO_CONFIG.timePeriod}`,
     `Market cap: ${AXIOM_AUTO_CONFIG.minMarketCapSol}-${AXIOM_AUTO_CONFIG.maxMarketCapSol} SOL`,

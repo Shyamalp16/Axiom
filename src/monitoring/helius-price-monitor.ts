@@ -705,12 +705,361 @@ export class HeliusPriceMonitor {
   }
 }
 
-// Export singleton instance
-let heliusMonitorInstance: HeliusPriceMonitor | null = null;
+// Graduated token polling subscription
+interface GraduatedTokenSubscription {
+  mint: string;
+  poolAddress: string;
+  callbacks: ((update: HeliusPriceUpdate) => void)[];
+  intervalId: NodeJS.Timeout | null;
+  lastPrice: number;
+  lastMcSol: number;
+}
 
-export function getHeliusPriceMonitor(): HeliusPriceMonitor {
+/**
+ * Extended Helius Price Monitor with support for graduated tokens
+ * Uses Helius RPC polling for graduated tokens (Raydium pools)
+ */
+export class HeliusPriceMonitorExtended extends HeliusPriceMonitor {
+  private graduatedSubscriptions: Map<string, GraduatedTokenSubscription> = new Map();
+  private pollIntervalMs = 2000; // Poll every 2 seconds
+  
+  /**
+   * Subscribe to price updates for a graduated token via Helius RPC polling
+   * This uses Helius RPC to fetch pool data periodically
+   */
+  async subscribeToGraduatedToken(
+    mint: string,
+    poolAddress: string,
+    callback: (update: HeliusPriceUpdate) => void,
+    pollIntervalMs: number = 2000
+  ): Promise<() => void> {
+    this.pollIntervalMs = pollIntervalMs;
+    
+    // Check if already subscribed
+    let subscription = this.graduatedSubscriptions.get(mint);
+    
+    if (subscription) {
+      subscription.callbacks.push(callback);
+      logger.debug(`[HELIUS] Added callback to existing graduated subscription for ${mint.slice(0, 8)}...`);
+      
+      // Send last known price if available
+      if (subscription.lastPrice > 0) {
+        callback({
+          mint,
+          bondingCurve: poolAddress,
+          priceSol: subscription.lastPrice,
+          priceUsd: subscription.lastPrice * this.getSolPrice(),
+          marketCapSol: subscription.lastMcSol,
+          marketCapUsd: subscription.lastMcSol * this.getSolPrice(),
+          virtualSolReserves: 0,
+          virtualTokenReserves: 0,
+          bondingCurveProgress: 100,
+          isGraduated: true,
+          timestamp: Date.now(),
+          slot: 0,
+          source: 'helius_onchain',
+        });
+      }
+      
+      return () => this.removeGraduatedCallback(mint, callback);
+    }
+    
+    // Create new subscription
+    subscription = {
+      mint,
+      poolAddress,
+      callbacks: [callback],
+      intervalId: null,
+      lastPrice: 0,
+      lastMcSol: 0,
+    };
+    
+    this.graduatedSubscriptions.set(mint, subscription);
+    
+    // Fetch initial price
+    await this.fetchGraduatedPrice(mint, subscription);
+    
+    // Start polling interval
+    subscription.intervalId = setInterval(async () => {
+      await this.fetchGraduatedPrice(mint, subscription!);
+    }, this.pollIntervalMs);
+    
+    logger.success(`[HELIUS] Subscribed to graduated token ${mint.slice(0, 8)}... (polling every ${pollIntervalMs}ms)`);
+    
+    return () => this.removeGraduatedCallback(mint, callback);
+  }
+  
+  /**
+   * Fetch current price for a graduated token via Helius RPC
+   */
+  private async fetchGraduatedPrice(mint: string, subscription: GraduatedTokenSubscription): Promise<void> {
+    try {
+      const rpcUrl = ENV.HELIUS_API_KEY 
+        ? `https://mainnet.helius-rpc.com/?api-key=${ENV.HELIUS_API_KEY}`
+        : ENV.SOLANA_RPC_URL;
+      
+      // Use Helius DAS API to get token price (more reliable for graduated tokens)
+      const response = await fetch(rpcUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'getAsset',
+          params: { id: mint },
+        }),
+      });
+      
+      if (response.ok) {
+        const data = await response.json() as any;
+        
+        // Check if asset has price info
+        if (data.result?.token_info?.price_info?.price_per_token) {
+          const priceUsd = data.result.token_info.price_info.price_per_token;
+          const supply = data.result.token_info.supply || 1_000_000_000_000_000; // 6 decimals
+          const actualSupply = supply / 1e6; // Convert from raw to human-readable
+          const solPrice = this.getSolPrice();
+          const priceSol = priceUsd / solPrice;
+          const mcSol = priceSol * actualSupply;
+          
+          subscription.lastPrice = priceSol;
+          subscription.lastMcSol = mcSol;
+          
+          const update: HeliusPriceUpdate = {
+            mint,
+            bondingCurve: subscription.poolAddress,
+            priceSol,
+            priceUsd,
+            marketCapSol: mcSol,
+            marketCapUsd: mcSol * solPrice,
+            virtualSolReserves: 0,
+            virtualTokenReserves: 0,
+            bondingCurveProgress: 100,
+            isGraduated: true,
+            timestamp: Date.now(),
+            slot: 0,
+            source: 'helius_onchain',
+          };
+          
+          for (const cb of subscription.callbacks) {
+            try {
+              cb(update);
+            } catch (err) {
+              logger.debug(`[HELIUS] Graduated callback error: ${err}`);
+            }
+          }
+          
+          logger.debug(`[HELIUS] Graduated price: ${mint.slice(0, 8)}... = ${priceSol.toExponential(4)} SOL`);
+          return;
+        }
+      }
+      
+      // Fallback: Try to get pool account data directly
+      await this.fetchPoolPrice(mint, subscription);
+      
+    } catch (error) {
+      logger.debug(`[HELIUS] Graduated price fetch error: ${error}`);
+    }
+  }
+  
+  /**
+   * Fetch price from pool account data (Raydium CPMM)
+   */
+  private async fetchPoolPrice(mint: string, subscription: GraduatedTokenSubscription): Promise<void> {
+    try {
+      const rpcUrl = ENV.HELIUS_API_KEY 
+        ? `https://mainnet.helius-rpc.com/?api-key=${ENV.HELIUS_API_KEY}`
+        : ENV.SOLANA_RPC_URL;
+      
+      // Fetch pool account
+      const response = await fetch(rpcUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'getAccountInfo',
+          params: [subscription.poolAddress, { encoding: 'base64' }],
+        }),
+      });
+      
+      if (!response.ok) {
+        return;
+      }
+      
+      const data = await response.json() as any;
+      
+      if (data.result?.value?.data) {
+        const accountData = data.result.value.data;
+        if (Array.isArray(accountData) && accountData[1] === 'base64') {
+          const buffer = Buffer.from(accountData[0], 'base64');
+          
+          // Try to parse as Raydium CPMM pool
+          // CPMM layout: discriminator(8) + amm_config(32) + pool_creator(32) + token_0_vault(32) + ...
+          // token_0_mint(32) + token_1_mint(32) + lp_mint(32) + token_0_amount(8) + token_1_amount(8) + ...
+          
+          if (buffer.length >= 300) {
+            // Try different pool layouts
+            const parsed = this.parsePoolData(buffer, mint);
+            if (parsed) {
+              subscription.lastPrice = parsed.priceSol;
+              subscription.lastMcSol = parsed.mcSol;
+              
+              const update: HeliusPriceUpdate = {
+                mint,
+                bondingCurve: subscription.poolAddress,
+                priceSol: parsed.priceSol,
+                priceUsd: parsed.priceSol * this.getSolPrice(),
+                marketCapSol: parsed.mcSol,
+                marketCapUsd: parsed.mcSol * this.getSolPrice(),
+                virtualSolReserves: parsed.solReserves,
+                virtualTokenReserves: parsed.tokenReserves,
+                bondingCurveProgress: 100,
+                isGraduated: true,
+                timestamp: Date.now(),
+                slot: 0,
+                source: 'helius_onchain',
+              };
+              
+              for (const cb of subscription.callbacks) {
+                try {
+                  cb(update);
+                } catch (err) {
+                  logger.debug(`[HELIUS] Pool callback error: ${err}`);
+                }
+              }
+              
+              logger.debug(`[HELIUS] Pool price: ${mint.slice(0, 8)}... = ${parsed.priceSol.toExponential(4)} SOL`);
+            }
+          }
+        }
+      }
+    } catch (error) {
+      logger.debug(`[HELIUS] Pool price fetch error: ${error}`);
+    }
+  }
+  
+  /**
+   * Parse pool account data to extract reserves and calculate price
+   */
+  private parsePoolData(buffer: Buffer, targetMint: string): { priceSol: number; mcSol: number; solReserves: number; tokenReserves: number } | null {
+    try {
+      // Raydium CPMM pool layout (simplified)
+      // Different pool types have different layouts, so we try common patterns
+      
+      // Pattern 1: Raydium CPMM
+      // Offsets may vary, common structure:
+      // - Various config/state data
+      // - Token vault amounts at specific offsets
+      
+      // Try to find token amounts (u64 values that look like reserves)
+      // Look for pairs of reasonable-looking reserve values
+      
+      for (let offset = 200; offset < Math.min(buffer.length - 16, 400); offset += 8) {
+        try {
+          const val1 = Number(buffer.readBigUInt64LE(offset));
+          const val2 = Number(buffer.readBigUInt64LE(offset + 8));
+          
+          // Check if these look like reserves (reasonable values)
+          // SOL reserves typically 1-1000 SOL (1e9 - 1e12 lamports)
+          // Token reserves typically 1M-1B tokens (1e12 - 1e15 with 6 decimals)
+          
+          const val1Sol = val1 / LAMPORTS_PER_SOL;
+          const val2Sol = val2 / LAMPORTS_PER_SOL;
+          const val1Tokens = val1 / 1e6;
+          const val2Tokens = val2 / 1e6;
+          
+          // Try to identify which is SOL and which is token
+          // SOL reserves for graduated tokens are typically 80-100 SOL initially
+          if (val1Sol >= 1 && val1Sol <= 10000 && val2Tokens >= 100_000 && val2Tokens <= 1_000_000_000_000) {
+            const priceSol = val1Sol / val2Tokens;
+            if (priceSol > 1e-12 && priceSol < 1) {
+              const mcSol = priceSol * 1_000_000_000; // 1B supply
+              return {
+                priceSol,
+                mcSol,
+                solReserves: val1Sol,
+                tokenReserves: val2Tokens,
+              };
+            }
+          }
+          
+          // Try reverse (token first, then SOL)
+          if (val2Sol >= 1 && val2Sol <= 10000 && val1Tokens >= 100_000 && val1Tokens <= 1_000_000_000_000) {
+            const priceSol = val2Sol / val1Tokens;
+            if (priceSol > 1e-12 && priceSol < 1) {
+              const mcSol = priceSol * 1_000_000_000;
+              return {
+                priceSol,
+                mcSol,
+                solReserves: val2Sol,
+                tokenReserves: val1Tokens,
+              };
+            }
+          }
+        } catch {
+          continue;
+        }
+      }
+      
+      return null;
+    } catch {
+      return null;
+    }
+  }
+  
+  /**
+   * Remove callback from graduated subscription
+   */
+  private removeGraduatedCallback(mint: string, callback: (update: HeliusPriceUpdate) => void): void {
+    const subscription = this.graduatedSubscriptions.get(mint);
+    if (!subscription) return;
+    
+    const index = subscription.callbacks.indexOf(callback);
+    if (index > -1) {
+      subscription.callbacks.splice(index, 1);
+    }
+    
+    // If no more callbacks, stop polling
+    if (subscription.callbacks.length === 0) {
+      if (subscription.intervalId) {
+        clearInterval(subscription.intervalId);
+      }
+      this.graduatedSubscriptions.delete(mint);
+      logger.debug(`[HELIUS] Unsubscribed from graduated token ${mint.slice(0, 8)}...`);
+    }
+  }
+  
+  /**
+   * Check if a graduated token is subscribed
+   */
+  isGraduatedSubscribed(mint: string): boolean {
+    return this.graduatedSubscriptions.has(mint);
+  }
+  
+  /**
+   * Disconnect and clean up all subscriptions
+   */
+  override disconnect(): void {
+    // Clean up graduated subscriptions
+    for (const [mint, sub] of this.graduatedSubscriptions) {
+      if (sub.intervalId) {
+        clearInterval(sub.intervalId);
+      }
+    }
+    this.graduatedSubscriptions.clear();
+    
+    // Call parent disconnect
+    super.disconnect();
+  }
+}
+
+// Export singleton instance
+let heliusMonitorInstance: HeliusPriceMonitorExtended | null = null;
+
+export function getHeliusPriceMonitor(): HeliusPriceMonitorExtended {
   if (!heliusMonitorInstance) {
-    heliusMonitorInstance = new HeliusPriceMonitor();
+    heliusMonitorInstance = new HeliusPriceMonitorExtended();
   }
   return heliusMonitorInstance;
 }
