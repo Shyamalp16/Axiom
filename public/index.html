@@ -18,6 +18,7 @@
         </div>
         <nav class="tabs">
           <button class="tab active" data-tab="positions">Positions</button>
+          <button class="tab" data-tab="tracker">Tracker</button>
           <button class="tab" data-tab="stats">Stats</button>
           <button class="tab" data-tab="control">Control</button>
         </nav>
@@ -48,6 +49,74 @@
                 <h3>No position selected</h3>
                 <p>Select a position to view price action, MC, and PnL.</p>
               </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="tracker" class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>Wallet Tracker</h2>
+              <p class="muted">Track wallets and monitor their transactions in real-time.</p>
+            </div>
+            <div class="panel-actions">
+              <div class="filter-group">
+                <button class="tracker-filter-btn active" data-filter="all">All</button>
+                <button class="tracker-filter-btn" data-filter="buy">Buys</button>
+                <button class="tracker-filter-btn" data-filter="sell">Sells</button>
+              </div>
+              <div class="status-pill" id="trackerStatus">Loading…</div>
+            </div>
+          </div>
+
+          <div class="mirror-panel">
+            <div class="mirror-control-bar">
+              <div class="mirror-status" id="mirrorStatus">
+                <span class="mirror-indicator" id="mirrorIndicator"></span>
+                <span id="mirrorStatusText">Mirror: Off</span>
+              </div>
+              <div class="mirror-stats" id="mirrorStats">
+                <span>Buys: <strong id="mirrorBuys">0</strong></span>
+                <span>Sells: <strong id="mirrorSells">0</strong></span>
+                <span>PnL: <strong id="mirrorPnl" class="positive">0.0000</strong> SOL</span>
+              </div>
+              <div class="mirror-actions">
+                <button class="btn btn-small btn-primary" id="startMirrorBtn">Start Mirror</button>
+                <button class="btn btn-small btn-secondary" id="stopMirrorBtn" disabled>Stop</button>
+                <button class="btn btn-small btn-secondary" id="resetMirrorBtn">Reset</button>
+              </div>
+            </div>
+            
+            <div class="mirror-details" id="mirrorDetails">
+              <div class="mirror-positions-section">
+                <h4>Active Mirrored Positions</h4>
+                <div class="mirror-positions-list" id="mirrorPositionsList">
+                  <div class="empty-state-small">No active positions</div>
+                </div>
+              </div>
+              <div class="mirror-trades-section">
+                <h4>Recent Mirror Trades</h4>
+                <div class="mirror-trades-list" id="mirrorTradesList">
+                  <div class="empty-state-small">No trades yet</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="tracker-layout">
+            <div class="tracker-sidebar">
+              <div class="wallet-list-header">
+                <h3>Tracked Wallets</h3>
+                <button class="btn btn-small btn-primary" id="refreshWalletsBtn">↻</button>
+              </div>
+              <div class="wallet-list" id="walletList"></div>
+            </div>
+            <div class="tracker-main">
+              <div class="transactions-header">
+                <h3 id="transactionsTitle">All Transactions</h3>
+                <span class="muted" id="transactionsCount">0 transactions</span>
+              </div>
+              <div class="transactions-list" id="transactionsList"></div>
             </div>
           </div>
         </section>
@@ -114,6 +183,38 @@
                 <input type="number" id="paperResetInput" min="0" step="0.1" value="2" />
                 <button class="btn btn-secondary" type="submit">Reset Paper</button>
               </form>
+            </div>
+            <div class="control-card">
+              <h3>Axiom Authentication</h3>
+              <div class="auth-status" id="authStatus">
+                <span class="auth-indicator" id="authIndicator"></span>
+                <span id="authStatusText">Checking...</span>
+              </div>
+              <form class="control-form" id="authUpdateForm">
+                <label>Refresh Token (required, lasts ~30 days)</label>
+                <textarea 
+                  id="refreshTokenInput" 
+                  placeholder="Paste auth-refresh-token from Axiom cookies"
+                  rows="3"
+                  style="font-family: monospace; font-size: 11px;"
+                ></textarea>
+                <label>Access Token (optional, auto-fetched if empty)</label>
+                <textarea 
+                  id="accessTokenInput" 
+                  placeholder="Optional: paste auth-access-token"
+                  rows="2"
+                  style="font-family: monospace; font-size: 11px;"
+                ></textarea>
+                <button class="btn btn-primary" type="submit" id="updateAuthBtn">Update Tokens</button>
+              </form>
+              <div class="auth-help">
+                <p class="muted">To get tokens:</p>
+                <ol class="muted" style="font-size: 12px; margin-left: 16px;">
+                  <li>Login to <a href="https://axiom.trade" target="_blank">axiom.trade</a></li>
+                  <li>Open DevTools (F12) → Application → Cookies</li>
+                  <li>Copy <code>auth-refresh-token</code> value</li>
+                </ol>
+              </div>
             </div>
           </div>
         </section>

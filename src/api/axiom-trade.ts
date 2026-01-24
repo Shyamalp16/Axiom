@@ -172,6 +172,15 @@ export interface AxiomNewPair {
 // AUTH TOKEN MANAGEMENT
 // ============================================
 
+import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'fs';
+import { resolve, dirname, join } from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename_auth = fileURLToPath(import.meta.url);
+const __dirname_auth = dirname(__filename_auth);
+const DATA_DIR = resolve(__dirname_auth, '../../data');
+const TOKEN_FILE = resolve(DATA_DIR, 'axiom_tokens.json');
+
 let accessToken: string | null = null;
 let refreshToken: string | null = null;
 let tokenExpiresAt: number = 0;
@@ -179,9 +188,106 @@ let tokenExpiresAt: number = 0;
 // Token refresh buffer (refresh 2 min before expiry)
 const TOKEN_REFRESH_BUFFER_MS = 2 * 60 * 1000;
 
+// Auto-refresh timer
+let autoRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+let autoRefreshEnabled = true;
+
+// Mutex lock for token refresh to prevent concurrent refreshes
+let refreshInProgress: Promise<void> | null = null;
+
+// Lock for file saves to prevent concurrent writes
+let saveInProgress = false;
+
+/**
+ * Save tokens to persistent storage
+ * This ensures tokens survive app restarts
+ * Uses a lock to prevent concurrent writes that could corrupt the file
+ */
+function saveTokensToFile(): void {
+  // Skip if another save is in progress
+  if (saveInProgress) {
+    logger.debug('Token save already in progress, skipping');
+    return;
+  }
+  
+  saveInProgress = true;
+  try {
+    if (!existsSync(DATA_DIR)) {
+      mkdirSync(DATA_DIR, { recursive: true });
+    }
+    const data = {
+      accessToken,
+      refreshToken,
+      tokenExpiresAt,
+      updatedAt: new Date().toISOString(),
+    };
+    writeFileSync(TOKEN_FILE, JSON.stringify(data, null, 2));
+    logger.debug('Axiom tokens saved to file');
+  } catch (error) {
+    logger.warn('Failed to save Axiom tokens to file:', error);
+  } finally {
+    saveInProgress = false;
+  }
+}
+
+/**
+ * Clear saved tokens (useful when tokens are corrupted)
+ * After clearing, restart the app and it will load from .env
+ */
+export function clearSavedTokens(): void {
+  try {
+    if (existsSync(TOKEN_FILE)) {
+      unlinkSync(TOKEN_FILE);
+      logger.info('Cleared saved Axiom tokens');
+    }
+    accessToken = null;
+    refreshToken = null;
+    tokenExpiresAt = 0;
+    refreshInProgress = null;
+  } catch (error) {
+    logger.warn('Failed to clear token file:', error);
+  }
+}
+
+/**
+ * Load tokens from persistent storage
+ * Returns true if valid tokens were loaded
+ * Automatically starts auto-refresh if tokens are valid
+ */
+function loadTokensFromFile(): boolean {
+  try {
+    if (!existsSync(TOKEN_FILE)) {
+      return false;
+    }
+    const data = JSON.parse(readFileSync(TOKEN_FILE, 'utf-8'));
+    if (data.refreshToken) {
+      refreshToken = data.refreshToken;
+      // Only load access token if it's not expired
+      if (data.accessToken && data.tokenExpiresAt && data.tokenExpiresAt > Date.now()) {
+        accessToken = data.accessToken;
+        tokenExpiresAt = data.tokenExpiresAt;
+        logger.info('Axiom tokens loaded from file (valid until ' + new Date(tokenExpiresAt).toLocaleTimeString() + ')');
+        // Start auto-refresh to keep tokens fresh
+        scheduleAutoRefresh();
+        return true;
+      }
+      // Access token expired, but we have refresh token - will refresh on first use
+      logger.info('Axiom refresh token loaded from file (access token expired, will refresh)');
+      // Schedule immediate refresh
+      scheduleAutoRefresh();
+      return true;
+    }
+    return false;
+  } catch (error) {
+    logger.debug('Failed to load Axiom tokens from file:', error);
+    return false;
+  }
+}
+
 /**
  * Initialize Axiom Trade client with auth tokens
  * Get these from browser cookies after logging into axiom.trade
+ * Automatically starts auto-refresh to keep tokens fresh
  */
 export function initAxiomAuth(access: string, refresh: string): void {
   accessToken = access;
@@ -198,17 +304,30 @@ export function initAxiomAuth(access: string, refresh: string): void {
     tokenExpiresAt = Date.now() + 15 * 60 * 1000;
     logger.warn('Could not parse token expiry, assuming 15 min');
   }
+  
+  // Save to file for persistence across restarts
+  saveTokensToFile();
+  
+  // Start auto-refresh to keep tokens fresh automatically
+  scheduleAutoRefresh();
 }
 
 /**
- * Load auth tokens from environment variables
+ * Load auth tokens - tries file first, then environment variables
+ * The file takes precedence because it contains refreshed tokens
  */
 export function loadAxiomAuthFromEnv(): boolean {
+  // First, try to load from file (contains refreshed tokens)
+  if (loadTokensFromFile()) {
+    return true;
+  }
+  
+  // Fallback to environment variables
   const access = process.env.AXIOM_ACCESS_TOKEN;
   const refresh = process.env.AXIOM_REFRESH_TOKEN;
   
   if (!access || !refresh) {
-    logger.warn('Axiom Trade tokens not found in environment');
+    logger.warn('Axiom Trade tokens not found in environment or file');
     logger.info('  Set AXIOM_ACCESS_TOKEN and AXIOM_REFRESH_TOKEN in .env');
     return false;
   }
@@ -218,26 +337,76 @@ export function loadAxiomAuthFromEnv(): boolean {
 }
 
 /**
+ * Update tokens via API (for UI token update endpoint)
+ * Automatically starts auto-refresh after update
+ */
+export function updateAxiomTokens(access: string | null, refresh: string): boolean {
+  if (!refresh) {
+    return false;
+  }
+  
+  refreshToken = refresh;
+  
+  if (access) {
+    accessToken = access;
+    try {
+      const payload = JSON.parse(Buffer.from(access.split('.')[1], 'base64').toString());
+      tokenExpiresAt = payload.exp * 1000;
+    } catch {
+      tokenExpiresAt = Date.now() + 15 * 60 * 1000;
+    }
+  } else {
+    // No access token provided, will fetch on next request
+    accessToken = null;
+    tokenExpiresAt = 0;
+  }
+  
+  saveTokensToFile();
+  logger.success('Axiom tokens updated');
+  
+  // Start/restart auto-refresh with new tokens
+  scheduleAutoRefresh();
+  
+  return true;
+}
+
+/**
  * Check if tokens are configured
  */
 export function isAxiomAuthenticated(): boolean {
-  return accessToken !== null && refreshToken !== null;
+  return refreshToken !== null; // Only need refresh token - access will be fetched
 }
 
 /**
  * Get current access token, refreshing if needed
+ * Uses mutex to prevent concurrent refresh attempts
  */
 async function getAccessToken(): Promise<string> {
-  if (!accessToken || !refreshToken) {
+  if (!refreshToken) {
     throw new Error('Axiom Trade not authenticated. Call initAxiomAuth() first.');
   }
   
-  // Check if token needs refresh
-  if (Date.now() > tokenExpiresAt - TOKEN_REFRESH_BUFFER_MS) {
-    await refreshAccessToken();
+  // If a refresh is already in progress, wait for it
+  if (refreshInProgress) {
+    await refreshInProgress;
+    // After waiting, check if we now have a valid token
+    if (accessToken && Date.now() < tokenExpiresAt - TOKEN_REFRESH_BUFFER_MS) {
+      return accessToken;
+    }
   }
   
-  return accessToken;
+  // Check if token needs refresh (or doesn't exist)
+  if (!accessToken || Date.now() > tokenExpiresAt - TOKEN_REFRESH_BUFFER_MS) {
+    // Double-check no refresh started while we were checking
+    if (!refreshInProgress) {
+      refreshInProgress = refreshAccessToken().finally(() => {
+        refreshInProgress = null;
+      });
+    }
+    await refreshInProgress;
+  }
+  
+  return accessToken!;
 }
 
 /**
@@ -251,6 +420,8 @@ async function refreshAccessToken(): Promise<void> {
   
   const maxRetries = 3;
   const transientErrors = [502, 503, 504, 429];
+  // Auth errors that mean the refresh token is invalid (need to re-login)
+  const authFailureErrors = [401, 403];
   let lastError: Error | null = null;
   
   for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -258,16 +429,35 @@ async function refreshAccessToken(): Promise<void> {
     const server = AXIOM_API_SERVERS[(currentServerIndex + attempt) % AXIOM_API_SERVERS.length];
     
     try {
+      // Send both tokens - Axiom may require the access token too for session validation
+      const cookieHeader = accessToken 
+        ? `auth-access-token=${accessToken}; auth-refresh-token=${refreshToken}`
+        : `auth-refresh-token=${refreshToken}`;
+      
       const response = await fetch(`${server}/refresh-access-token`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Cookie': `auth-refresh-token=${refreshToken}`,
+          'Cookie': cookieHeader,
           'Origin': 'https://axiom.trade',
+          'Referer': 'https://axiom.trade/',
         },
       });
       
       if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        const isSessionInvalid = errorText.toLowerCase().includes('session invalid') || 
+                                  errorText.toLowerCase().includes('login again');
+        
+        // Check if the refresh token itself is invalid (auth failure or session invalid)
+        if (authFailureErrors.includes(response.status) || isSessionInvalid) {
+          logger.error(`❌ Refresh token is invalid or expired (${response.status}): ${errorText}`);
+          logger.error(`   Please login again at axiom.trade and update your tokens.`);
+          // Clear invalid tokens so isAxiomAuthenticated() returns false
+          invalidateTokens();
+          throw new Error(`Refresh token invalid (${response.status}): Please login again at axiom.trade and update tokens`);
+        }
+        
         // Check if this is a transient error worth retrying
         if (transientErrors.includes(response.status) && attempt < maxRetries - 1) {
           const delay = Math.pow(2, attempt) * 1000; // 1s, 2s, 4s
@@ -275,11 +465,17 @@ async function refreshAccessToken(): Promise<void> {
           await new Promise(resolve => setTimeout(resolve, delay));
           continue;
         }
-        throw new Error(`Token refresh failed: ${response.status}`);
+        throw new Error(`Token refresh failed: ${response.status} ${errorText}`);
       }
       
-      const data = await response.json() as { access_token: string };
+      const data = await response.json() as { access_token: string; refresh_token?: string };
       accessToken = data.access_token;
+      
+      // IMPORTANT: Axiom may return a new refresh token - update it if provided
+      if (data.refresh_token) {
+        logger.info(`🔄 Received new refresh token from Axiom`);
+        refreshToken = data.refresh_token;
+      }
       
       // Parse new expiry
       try {
@@ -289,11 +485,19 @@ async function refreshAccessToken(): Promise<void> {
         tokenExpiresAt = Date.now() + 15 * 60 * 1000;
       }
       
+      // Save refreshed tokens to file for persistence
+      saveTokensToFile();
+      
       logger.debug(`Axiom access token refreshed via ${server}`);
       return; // Success!
       
     } catch (error) {
       lastError = error as Error;
+      
+      // Don't retry if it's an auth failure (refresh token is invalid)
+      if (error instanceof Error && error.message.includes('Refresh token invalid')) {
+        throw error;
+      }
       
       // Only retry on network errors, not on auth failures
       if (attempt < maxRetries - 1 && !(error instanceof Error && error.message.includes('Token refresh failed: 4'))) {
@@ -307,6 +511,156 @@ async function refreshAccessToken(): Promise<void> {
   
   logger.error('Failed to refresh Axiom token after all retries:', lastError);
   throw lastError || new Error('Token refresh failed after all retries');
+}
+
+/**
+ * Invalidate tokens when auth fails permanently
+ * This ensures isAxiomAuthenticated() returns false
+ */
+function invalidateTokens(): void {
+  refreshToken = null;
+  accessToken = null;
+  tokenExpiresAt = 0;
+  
+  // Stop auto-refresh
+  if (autoRefreshTimer) {
+    clearTimeout(autoRefreshTimer);
+    autoRefreshTimer = null;
+  }
+  
+  // Delete the tokens file
+  try {
+    const tokensPath = join(process.cwd(), '.axiom-tokens.json');
+    if (existsSync(tokensPath)) {
+      unlinkSync(tokensPath);
+    }
+  } catch {
+    // Ignore deletion errors
+  }
+  
+  logger.warn('⚠️ Axiom tokens have been invalidated. Please update your tokens via the UI or .env file.');
+}
+
+// ============================================
+// AUTO-REFRESH MECHANISM
+// ============================================
+
+/**
+ * Schedule the next automatic token refresh
+ * Runs 2 minutes before the token expires
+ */
+function scheduleAutoRefresh(): void {
+  // Clear any existing timer
+  if (autoRefreshTimer) {
+    clearTimeout(autoRefreshTimer);
+    autoRefreshTimer = null;
+  }
+  
+  if (!autoRefreshEnabled || !refreshToken) {
+    return;
+  }
+  
+  // Calculate when to refresh (2 min before expiry, minimum 30 seconds from now)
+  const now = Date.now();
+  const refreshAt = Math.max(
+    tokenExpiresAt - TOKEN_REFRESH_BUFFER_MS,
+    now + 30 * 1000 // At least 30 seconds from now
+  );
+  const delayMs = refreshAt - now;
+  
+  // Don't schedule if token already expired or will expire very soon
+  if (delayMs < 0 || tokenExpiresAt < now) {
+    logger.debug('Token already expired, refreshing immediately');
+    performAutoRefresh();
+    return;
+  }
+  
+  const refreshTime = new Date(refreshAt).toLocaleTimeString();
+  logger.info(`🔄 Auto-refresh scheduled for ${refreshTime} (in ${Math.round(delayMs / 1000 / 60)} min)`);
+  
+  autoRefreshTimer = setTimeout(performAutoRefresh, delayMs);
+}
+
+/**
+ * Perform the automatic token refresh
+ */
+async function performAutoRefresh(): Promise<void> {
+  if (!autoRefreshEnabled || !refreshToken) {
+    return;
+  }
+  
+  // Skip if a refresh is already in progress (another call might have triggered it)
+  if (refreshInProgress) {
+    logger.debug('🔄 Refresh already in progress, skipping auto-refresh');
+    try {
+      await refreshInProgress;
+      scheduleAutoRefresh();
+    } catch {
+      // Error handled by the original refresh caller
+    }
+    return;
+  }
+  
+  logger.info('🔄 Auto-refreshing Axiom token...');
+  
+  try {
+    // Force token expiry to trigger refresh via getAccessToken (uses mutex)
+    tokenExpiresAt = 0;
+    await getAccessToken();
+    logger.success('🔄 Axiom token auto-refreshed successfully');
+    
+    // Schedule the next refresh
+    scheduleAutoRefresh();
+    
+  } catch (error) {
+    logger.error('🔄 Auto-refresh failed:', error);
+    
+    // Retry in 1 minute if it failed
+    if (autoRefreshEnabled && refreshToken) {
+      logger.info('🔄 Will retry auto-refresh in 1 minute...');
+      autoRefreshTimer = setTimeout(performAutoRefresh, 60 * 1000);
+    }
+  }
+}
+
+/**
+ * Start automatic token refresh
+ * This will proactively refresh tokens before they expire
+ */
+export function startAutoRefresh(): void {
+  autoRefreshEnabled = true;
+  
+  if (!refreshToken) {
+    logger.warn('Cannot start auto-refresh: no refresh token available');
+    return;
+  }
+  
+  logger.info('🔄 Starting automatic token refresh');
+  scheduleAutoRefresh();
+}
+
+/**
+ * Stop automatic token refresh
+ */
+export function stopAutoRefresh(): void {
+  autoRefreshEnabled = false;
+  
+  if (autoRefreshTimer) {
+    clearTimeout(autoRefreshTimer);
+    autoRefreshTimer = null;
+  }
+  
+  logger.info('🔄 Automatic token refresh stopped');
+}
+
+/**
+ * Get auto-refresh status
+ */
+export function getAutoRefreshStatus(): { enabled: boolean; nextRefreshAt: number | null } {
+  return {
+    enabled: autoRefreshEnabled && refreshToken !== null,
+    nextRefreshAt: autoRefreshTimer ? tokenExpiresAt - TOKEN_REFRESH_BUFFER_MS : null,
+  };
 }
 
 // ============================================
@@ -1138,26 +1492,60 @@ async function axiomTrackerFetch<T>(
     headers,
   });
   
-  if (response.status === 401) {
-    // Token might have expired, try refresh
-    await refreshAccessToken();
-    const newToken = await getAccessToken();
-    headers['Cookie'] = `auth-access-token=${newToken}; auth-refresh-token=${refreshToken}`;
+  // Check response - need to handle both 401 AND "Session invalid" errors (Axiom returns 500 for session errors)
+  const isAuthError = response.status === 401;
+  let errorText = '';
+  
+  if (!response.ok) {
+    errorText = await response.text().catch(() => '');
+  }
+  
+  // Detect session invalid errors (Axiom returns these as 500, not 401)
+  const isSessionInvalid = errorText.toLowerCase().includes('session invalid') || 
+                           errorText.toLowerCase().includes('login again') ||
+                           errorText.toLowerCase().includes('please login');
+  
+  if (isAuthError || isSessionInvalid) {
+    // Token might have expired or session is invalid, force refresh via getAccessToken
+    logger.warn(`[AXIOM] Session error detected (${response.status}), attempting token refresh...`);
     
-    const retryResponse = await fetch(`${AXIOM_TRACKER_API}${endpoint}`, {
-      ...options,
-      headers,
-    });
-    
-    if (!retryResponse.ok) {
-      throw new Error(`Axiom Tracker API error: ${retryResponse.status}`);
+    try {
+      // Force token expiry to trigger refresh via getAccessToken (uses mutex)
+      tokenExpiresAt = 0;
+      const newToken = await getAccessToken();
+      headers['Cookie'] = `auth-access-token=${newToken}; auth-refresh-token=${refreshToken}`;
+      
+      const retryResponse = await fetch(`${AXIOM_TRACKER_API}${endpoint}`, {
+        ...options,
+        headers,
+      });
+      
+      if (!retryResponse.ok) {
+        const retryErrorText = await retryResponse.text().catch(() => '');
+        const retryIsSessionInvalid = retryErrorText.toLowerCase().includes('session invalid') || 
+                                       retryErrorText.toLowerCase().includes('login again');
+        
+        // If still session error after refresh, the refresh token is invalid
+        if (retryResponse.status === 401 || retryIsSessionInvalid) {
+          logger.error(`[AXIOM] Session still invalid after token refresh - refresh token is likely expired`);
+          invalidateTokens();
+          throw new Error('Session expired. Please login again at axiom.trade and update your tokens.');
+        }
+        throw new Error(`Axiom Tracker API error: ${retryResponse.status} ${retryErrorText}`);
+      }
+      
+      logger.success(`[AXIOM] Token refresh successful, request retried`);
+      return retryResponse.json() as Promise<T>;
+    } catch (error) {
+      // Re-throw auth errors with clear message
+      if (error instanceof Error && (error.message.includes('Refresh token invalid') || error.message.includes('Session expired'))) {
+        throw error;
+      }
+      throw new Error('Authentication failed. Please update your Axiom tokens.');
     }
-    
-    return retryResponse.json() as Promise<T>;
   }
   
   if (!response.ok) {
-    const errorText = await response.text();
     throw new Error(`Axiom Tracker API error ${response.status}: ${errorText}`);
   }
   
@@ -1376,7 +1764,7 @@ export async function getAxiomTrackedWalletTransactionsWithNames(
 
 /**
  * Monitor tracked wallets for new transactions
- * Polls the API at specified interval and calls callback on new transactions
+ * OPTIMIZED: Pre-warmed wallet map, faster polling, non-blocking callbacks
  */
 export function monitorTrackedWallets(
   callback: (transactions: AxiomWalletTransactionWithName[]) => void,
@@ -1389,21 +1777,46 @@ export function monitorTrackedWallets(
     includeWalletNames?: boolean;
   }
 ): () => void {
-  const pollInterval = options?.pollIntervalMs || 5000; // Default 5 seconds
-  const includeNames = options?.includeWalletNames !== false; // Default true
+  const pollInterval = options?.pollIntervalMs || 5000;
+  const includeNames = options?.includeWalletNames !== false;
   let lastSeenSignatures = new Set<string>();
   let walletNameMap: Map<string, { name: string; emoji: string }> | null = null;
   let isRunning = true;
+  let isPollInProgress = false;
+  let pollStartTime = 0;
+  let consecutiveErrors = 0;
+  const MAX_CONSECUTIVE_ERRORS = 5;
+  
+  // Pre-warm wallet name map immediately (don't wait for first poll)
+  if (includeNames) {
+    getWalletNameMap()
+      .then(map => {
+        walletNameMap = map;
+        logger.debug(`[TRACKER] Pre-warmed wallet name map: ${map.size} wallets`);
+      })
+      .catch(err => logger.debug(`[TRACKER] Failed to pre-warm wallet map: ${err}`));
+  }
   
   const poll = async () => {
     if (!isRunning) return;
     
-    try {
-      // Load wallet name map on first poll if needed
-      if (includeNames && !walletNameMap) {
-        walletNameMap = await getWalletNameMap();
+    // Prevent overlapping polls (important for fast polling)
+    if (isPollInProgress) {
+      // Skip this poll cycle if previous one is still running
+      if (Date.now() - pollStartTime > 10000) {
+        // But if it's been stuck for >10s, allow new poll
+        logger.warn('[TRACKER] Previous poll stuck, forcing new poll');
+        isPollInProgress = false;
+      } else {
+        setTimeout(poll, pollInterval);
+        return;
       }
-      
+    }
+    
+    isPollInProgress = true;
+    pollStartTime = Date.now();
+    
+    try {
       let transactions: AxiomWalletTransaction[];
       
       if (options?.onlyFirstBuys) {
@@ -1428,32 +1841,58 @@ export function monitorTrackedWallets(
         }
       }
       
+      // Reset error counter on success
+      consecutiveErrors = 0;
+      
       // Find new transactions (not seen before)
       const newTransactions = transactions.filter(tx => 
         !lastSeenSignatures.has(tx.signature)
       );
       
       // Update seen signatures
-      transactions.forEach(tx => lastSeenSignatures.add(tx.signature));
+      for (const tx of transactions) {
+        lastSeenSignatures.add(tx.signature);
+      }
       
-      // Keep set size manageable (last 1000 signatures)
-      if (lastSeenSignatures.size > 1000) {
+      // Keep set size manageable
+      if (lastSeenSignatures.size > 2000) {
         const arr = Array.from(lastSeenSignatures);
-        lastSeenSignatures = new Set(arr.slice(-500));
+        lastSeenSignatures = new Set(arr.slice(-1000));
       }
       
       // Call callback if there are new transactions
       if (newTransactions.length > 0) {
-        // Enrich with wallet names if enabled
         const enrichedTxs = includeNames && walletNameMap 
           ? enrichTransactionsWithNames(newTransactions, walletNameMap)
           : newTransactions.map(tx => ({ ...tx } as AxiomWalletTransactionWithName));
         
-        callback(enrichedTxs);
+        // Don't await callback - let it run async for speed
+        try {
+          callback(enrichedTxs);
+        } catch (callbackError) {
+          logger.debug(`[TRACKER] Callback error: ${callbackError}`);
+        }
       }
       
     } catch (error) {
-      logger.debug(`Wallet tracker poll error: ${error}`);
+      consecutiveErrors++;
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      
+      // Only log every few errors to avoid spam
+      if (consecutiveErrors <= 3 || consecutiveErrors % 10 === 0) {
+        logger.debug(`[TRACKER] Poll error (${consecutiveErrors}): ${errorMsg}`);
+      }
+      
+      // Back off if too many consecutive errors
+      if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+        const backoffMs = Math.min(pollInterval * 2, 10000);
+        logger.warn(`[TRACKER] Too many errors, backing off for ${backoffMs}ms`);
+        isPollInProgress = false;
+        setTimeout(poll, backoffMs);
+        return;
+      }
+    } finally {
+      isPollInProgress = false;
     }
     
     // Schedule next poll
@@ -1462,14 +1901,17 @@ export function monitorTrackedWallets(
     }
   };
   
-  // Start polling
-  logger.info(`Starting wallet tracker monitor (polling every ${pollInterval / 1000}s)`);
+  // Start polling immediately
+  const intervalDesc = pollInterval < 1000 
+    ? `${pollInterval}ms` 
+    : `${(pollInterval / 1000).toFixed(1)}s`;
+  logger.info(`[TRACKER] Starting monitor (${intervalDesc} polling)`);
   poll();
   
   // Return stop function
   return () => {
     isRunning = false;
-    logger.info('Wallet tracker monitor stopped');
+    logger.info('[TRACKER] Monitor stopped');
   };
 }
 

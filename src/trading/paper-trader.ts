@@ -143,6 +143,8 @@ export interface PaperPosition {
   avgEntryPrice: number;
   costBasis: number;
   entryTime: Date;
+  // Entry MC tracking for DCA - weighted average of MC at each buy
+  entryMcUsd?: number;
 }
 
 // In-memory state
@@ -165,14 +167,21 @@ let paperTrades: PaperTrade[] = [];
 // Paper trading behavior flags
 const PAPER_TRADING_SKIP_FEES = true;
 
+// Track if paper trades have been loaded (to avoid repeated log spam)
+let paperTradesLoaded = false;
+let lastLoadedTradeCount = 0;
+
 /**
  * Load paper trades from disk
+ * Only logs on first load or when trade count changes
  */
 export function loadPaperTrades(): void {
   try {
     if (existsSync(PAPER_TRADES_FILE)) {
       const data = readFileSync(PAPER_TRADES_FILE, 'utf-8');
       const parsed = JSON.parse(data);
+      const newTradeCount = (parsed.trades || []).length;
+      
       paperTrades = parsed.trades || [];
       
       // Restore portfolio state
@@ -183,7 +192,12 @@ export function loadPaperTrades(): void {
         };
       }
       
-      logger.info(`Loaded ${paperTrades.length} paper trades from history`);
+      // Only log on first load or when data changed
+      if (!paperTradesLoaded || newTradeCount !== lastLoadedTradeCount) {
+        logger.info(`Loaded ${paperTrades.length} paper trades from history`);
+        lastLoadedTradeCount = newTradeCount;
+      }
+      paperTradesLoaded = true;
     }
   } catch (error) {
     logger.warn('Could not load paper trades, starting fresh');
@@ -212,13 +226,18 @@ export function savePaperTrades(): void {
 
 /**
  * Simulate a buy order
+ * @param prefetchedToken - Optional pre-fetched token data to avoid duplicate network calls
+ * @param skipMcCapture - If true, MC will be captured async (faster for mirroring)
  */
 export async function paperBuy(
   mint: string,
   symbol: string,
   solAmount: number,
-  checklistPassed: string[] = []
+  checklistPassed: string[] = [],
+  prefetchedToken?: any,
+  skipMcCapture: boolean = false
 ): Promise<PaperTrade> {
+  const startTime = Date.now();
   logger.info(`📝 [PAPER] Simulating BUY: ${solAmount} SOL → ${symbol}`);
   
   // Check balance
@@ -226,8 +245,8 @@ export async function paperBuy(
     throw new Error(`Insufficient paper balance: ${portfolio.currentBalanceSOL.toFixed(4)} SOL`);
   }
   
-  // Detect platform and get price
-  const pumpToken = await fetchPumpFunToken(mint);
+  // Use pre-fetched token data if available (faster for mirroring)
+  const pumpToken = prefetchedToken || await fetchPumpFunToken(mint);
   const isPump = pumpToken && !pumpToken.isGraduated;
   
   let tokenAmount: number;
@@ -326,14 +345,34 @@ export async function paperBuy(
   portfolio.currentBalanceSOL -= (solAmount + estimatedFees);
   portfolio.totalTrades++;
   
-  // Add/update position
+  // Get current MC for entry tracking - use data we already have (no extra network call)
+  let currentMcUsd = 0;
+  if (pumpToken && pumpToken.marketCapUsd > 0) {
+    currentMcUsd = pumpToken.marketCapUsd;
+    logger.info(`📝 [PAPER] Entry MC: $${currentMcUsd.toFixed(0)}`);
+  }
+  
+  // Add/update position with DCA'd entry MC
   const existingPosition = portfolio.positions.get(mint);
   if (existingPosition) {
     const totalTokens = existingPosition.tokenAmount + tokenAmount;
     const totalCost = existingPosition.costBasis + solAmount;
+    
+    // DCA the entry MC: weighted average based on cost basis
+    let newEntryMcUsd = existingPosition.entryMcUsd || 0;
+    if (currentMcUsd > 0) {
+      const existingCost = existingPosition.costBasis;
+      const newCost = solAmount;
+      const existingMc = existingPosition.entryMcUsd || currentMcUsd;
+      // Weighted average: (existingMC * existingCost + currentMC * newCost) / totalCost
+      newEntryMcUsd = (existingMc * existingCost + currentMcUsd * newCost) / totalCost;
+      logger.info(`📝 [PAPER] DCA Entry MC: ${existingMc.toFixed(0)} → ${newEntryMcUsd.toFixed(0)} (bought at ${currentMcUsd.toFixed(0)})`);
+    }
+    
     existingPosition.tokenAmount = totalTokens;
     existingPosition.costBasis = totalCost;
     existingPosition.avgEntryPrice = totalCost / totalTokens;
+    existingPosition.entryMcUsd = newEntryMcUsd > 0 ? newEntryMcUsd : existingPosition.entryMcUsd;
   } else {
     portfolio.positions.set(mint, {
       mint,
@@ -342,8 +381,12 @@ export async function paperBuy(
       avgEntryPrice: pricePerToken,
       costBasis: solAmount,
       entryTime: new Date(),
+      entryMcUsd: currentMcUsd > 0 ? currentMcUsd : undefined,
     });
     logger.debug(`📝 [PAPER] Position added to portfolio: ${symbol} (${mint.slice(0,8)}...) - Total positions: ${portfolio.positions.size}`);
+    if (currentMcUsd > 0) {
+      logger.info(`📝 [PAPER] Entry MC: $${currentMcUsd.toFixed(0)}`);
+    }
   }
   
   paperTrades.push(trade);

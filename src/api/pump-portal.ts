@@ -476,11 +476,135 @@ export function getCachedToken(mint: string): PumpPortalToken | null {
  * Use this for live price monitoring
  */
 export async function fetchFreshPumpToken(mint: string): Promise<PumpPortalToken | null> {
+  // Add cache-busting timestamp and clear ETag cache
+  const cacheKey = `coins:${mint}`;
+  etagCache.delete(cacheKey); // Clear ETag to force fresh fetch
+  
   const token = await fetchTokenViaRestApi(mint, true);
   if (token) {
     tokenCache.set(mint, token);
   }
   return token;
+}
+
+/**
+ * Fetch ULTRA FRESH token data - bypasses ALL caching including pump.fun CDN
+ * Use this for real-time MC tracking
+ * 
+ * IMPORTANT: This function makes a direct API call with cache-busting to get
+ * the most recent market cap data. Do not add any caching here.
+ */
+export async function fetchUltraFreshPumpToken(mint: string): Promise<PumpPortalToken | null> {
+  if (!mint || mint.length < 32) {
+    logger.debug(`Invalid mint address: ${mint}`);
+    return null;
+  }
+
+  const PUMPFUN_API_URL = 'https://frontend-api-v3.pump.fun';
+  // Add cache-busting timestamp to bypass CDN caching
+  const cacheBuster = Date.now();
+  const url = `${PUMPFUN_API_URL}/coins/${mint}?sync=true&_t=${cacheBuster}`;
+  
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout
+    
+    const response = await fetch(url, {
+      headers: {
+        'Accept': 'application/json',
+        'Origin': 'https://pump.fun',
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        'Pragma': 'no-cache',
+      },
+      signal: controller.signal,
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (!response.ok) {
+      // Don't log 404s as errors - token might just not exist on pump.fun
+      if (response.status !== 404) {
+        logger.debug(`Ultra fresh fetch returned ${response.status} for ${mint.slice(0, 8)}...`);
+      }
+      return null;
+    }
+    
+    const data = await response.json() as any;
+    
+    if (!data || !data.mint) {
+      logger.debug(`Invalid response data for ${mint.slice(0, 8)}...`);
+      return null;
+    }
+    
+    // Get SOL price for conversions
+    const solPrice = await getSolPrice();
+    
+    // Extract market cap - try multiple fields
+    let marketCapUsd = 0;
+    if (data.usd_market_cap && data.usd_market_cap > 0) {
+      marketCapUsd = data.usd_market_cap;
+    } else if (data.market_cap_usd && data.market_cap_usd > 0) {
+      marketCapUsd = data.market_cap_usd;
+    } else if (data.market_cap && data.market_cap > 0) {
+      // market_cap might be in SOL, convert to USD
+      marketCapUsd = data.market_cap * solPrice;
+    }
+    
+    // Convert directly to PumpPortalToken
+    const token: PumpPortalToken = {
+      mint: data.mint,
+      name: data.name || 'Unknown',
+      symbol: data.symbol || 'UNKNOWN',
+      description: data.description || '',
+      imageUri: data.image_uri || '',
+      creator: data.creator || '',
+      createdTimestamp: data.created_timestamp || Date.now(),
+      ageMinutes: data.created_timestamp ? (Date.now() - data.created_timestamp) / 1000 / 60 : 0,
+      bondingCurve: data.bonding_curve || '',
+      virtualSolReserves: (data.virtual_sol_reserves || 0) / 1e9,
+      virtualTokenReserves: (data.virtual_token_reserves || 0) / 1e6,
+      realSolReserves: (data.real_sol_reserves || 0) / 1e9,
+      priceSol: 0,
+      priceUsd: 0,
+      marketCapSol: 0,
+      marketCapUsd: marketCapUsd,
+      bondingCurveProgress: 0,
+      isGraduated: data.complete === true || !!data.raydium_pool,
+      website: data.website,
+      twitter: data.twitter,
+      telegram: data.telegram,
+      tradeCount: data.reply_count || 0,
+      lastTradeTimestamp: data.last_reply,
+    };
+    
+    // Calculate prices from reserves if not provided
+    if (token.virtualSolReserves > 0 && token.virtualTokenReserves > 0) {
+      token.priceSol = token.virtualSolReserves / token.virtualTokenReserves;
+      token.priceUsd = token.priceSol * solPrice;
+    }
+    
+    // Calculate market cap in SOL if we have USD
+    if (token.marketCapUsd > 0 && solPrice > 0) {
+      token.marketCapSol = token.marketCapUsd / solPrice;
+    }
+    
+    // Calculate bonding curve progress
+    const BONDING_CURVE_SOL_TARGET = 85;
+    token.bondingCurveProgress = Math.min(100, (token.realSolReserves / BONDING_CURVE_SOL_TARGET) * 100);
+    
+    // DO NOT cache ultra-fresh results - we want fresh data each time
+    // tokenCache.set(mint, token);
+    
+    return token;
+    
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      logger.debug(`Ultra fresh fetch timed out for ${mint.slice(0, 8)}...`);
+    } else {
+      logger.debug(`Ultra fresh fetch failed for ${mint.slice(0, 8)}...: ${error}`);
+    }
+    return null;
+  }
 }
 
 /**

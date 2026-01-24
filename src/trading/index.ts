@@ -4,3 +4,4 @@ export * from './position-manager.js';
 export * from './tp-sl-manager.js';
 export * from './executor.js';
 export * from './paper-trader.js';
+export * from './mirror-trader.js';

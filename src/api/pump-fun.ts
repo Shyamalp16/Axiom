@@ -22,6 +22,7 @@ import {
   getCachedTrades,
   fetchTokenViaPumpPortal,
   fetchFreshPumpToken,
+  fetchUltraFreshPumpToken,
   waitForNewTokens,
   isConnectedToPumpPortal,
   fetchPumpFunRecentTrades as fetchTradesViaRest,
@@ -190,6 +191,59 @@ export async function fetchPumpFunToken(mintAddress: string, forceRefresh: boole
     
   } catch (error) {
     logger.debug(`Pump.fun fetch failed: ${error}`);
+    return null;
+  }
+}
+
+/**
+ * Fetch ULTRA FRESH token data - bypasses ALL caching including pump.fun CDN
+ * Use this for real-time MC tracking in the UI
+ * @param mintAddress - Token mint address  
+ */
+export async function fetchPumpFunTokenUltraFresh(mintAddress: string): Promise<PumpFunToken | null> {
+  try {
+    const portalToken = await fetchUltraFreshPumpToken(mintAddress);
+    
+    if (!portalToken) {
+      return null;
+    }
+    
+    const solPriceUsd = await getSolPriceUsd();
+    
+    const token: PumpFunToken = {
+      mint: portalToken.mint,
+      name: portalToken.name,
+      symbol: portalToken.symbol,
+      description: portalToken.description || '',
+      imageUri: portalToken.imageUri || '',
+      creator: portalToken.creator,
+      createdTimestamp: portalToken.createdTimestamp,
+      ageMinutes: portalToken.ageMinutes,
+      bondingCurve: portalToken.bondingCurve || '',
+      associatedBondingCurve: '',
+      virtualSolReserves: portalToken.virtualSolReserves,
+      virtualTokenReserves: portalToken.virtualTokenReserves,
+      realSolReserves: portalToken.realSolReserves,
+      realTokenReserves: 0,
+      priceUsd: portalToken.priceUsd > 0 ? portalToken.priceUsd : portalToken.priceSol * solPriceUsd,
+      priceSol: portalToken.priceSol,
+      marketCapUsd: portalToken.marketCapUsd > 0 ? portalToken.marketCapUsd : portalToken.marketCapSol * solPriceUsd,
+      marketCapSol: portalToken.marketCapSol,
+      bondingCurveProgress: portalToken.bondingCurveProgress > 0 
+        ? portalToken.bondingCurveProgress 
+        : Math.min(100, (portalToken.realSolReserves / BONDING_CURVE_SOL_TARGET) * 100),
+      isGraduated: portalToken.isGraduated,
+      website: portalToken.website,
+      twitter: portalToken.twitter,
+      telegram: portalToken.telegram,
+      replyCount: portalToken.tradeCount,
+      lastReply: portalToken.lastTradeTimestamp,
+    };
+    
+    return token;
+    
+  } catch (error) {
+    logger.debug(`Pump.fun ultra fresh fetch failed: ${error}`);
     return null;
   }
 }
